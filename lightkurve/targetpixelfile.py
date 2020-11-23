@@ -6,29 +6,62 @@ import os
 import warnings
 import logging
 
+import collections
+
 from astropy.io import fits
-from astropy.io.fits import Undefined
+from astropy.io.fits import Undefined, BinTableHDU
 from astropy.nddata import Cutout2D
 from astropy.table import Table
 from astropy.wcs import WCS
+from astropy.utils.exceptions import AstropyWarning
+from astropy.coordinates import SkyCoord
+from astropy.stats.funcs import median_absolute_deviation as MAD
+from astropy.utils.decorators import deprecated
+from astropy.time import Time
+from astropy.units import Quantity
+import astropy.units as u
+
 from matplotlib import patches
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import numpy as np
 from scipy.ndimage import label
 from tqdm import tqdm
-from astropy.coordinates import SkyCoord
-from astropy.stats.funcs import median_absolute_deviation as MAD
+from copy import deepcopy
 
 from . import PACKAGEDIR, MPLSTYLE
-from .lightcurve import KeplerLightCurve, TessLightCurve
+from .lightcurve import LightCurve, KeplerLightCurve, TessLightCurve
 from .prf import KeplerPRF
 from .utils import KeplerQualityFlags, TessQualityFlags, \
-                   plot_image, bkjd_to_astropy_time, btjd_to_astropy_time, \
-                   LightkurveWarning, detect_filetype
+                   plot_image, \
+                   LightkurveWarning, LightkurveDeprecationWarning, \
+                   validate_method, centroid_quadratic, \
+                   _query_solar_system_objects
+from .io import detect_filetype
+
+
 
 __all__ = ['KeplerTargetPixelFile', 'TessTargetPixelFile']
+
+
 log = logging.getLogger(__name__)
 
+
+class HduToMetaMapping(collections.abc.Mapping):
+    """Provides a read-only view of HDU header in `astropy.timeseries.TimeSeries.meta` format"""
+
+    def __init__(self, hdu):
+        self._dict = {}
+        self._dict.update(hdu.header)
+
+    def __getitem__(self, key):
+        return self._dict[key]
+
+    def __len__(self):
+        return len(self._dict)
+
+    def __iter__(self):
+        return iter(self._dict)
 
 class TargetPixelFile(object):
     """Abstract class representing FITS files which contain time series imaging data.
@@ -44,6 +77,9 @@ class TargetPixelFile(object):
             self.hdu = fits.open(self.path, **kwargs)
         self.quality_bitmask = quality_bitmask
         self.targetid = targetid
+
+        # For consistency with `LightCurve`, provide a `meta` dictionary
+        self.meta = HduToMetaMapping(self.hdu[0])
 
     def __getitem__(self, key):
         """Implements indexing and slicing.
@@ -70,18 +106,71 @@ class TargetPixelFile(object):
         with warnings.catch_warnings():
             # Ignore warnings about empty fields
             warnings.simplefilter('ignore', UserWarning)
-            # AstroPy added `HDUList.copy()` in v3.1, but we don't want to make
-            # v3.1 a minimum requirement yet, so we copy in a funny way.
-            copy = fits.HDUList([myhdu.copy() for myhdu in self.hdu])
-            copy[1].data = copy[1].data[selected_idx]
+            # AstroPy added `HDUList.copy()` in v3.1, allowing us to avoid manually
+            # copying the HDUs, which brought along unexpected memory leaks.
+            copy = self.hdu.copy()
+            copy[1] = BinTableHDU(data=self.hdu[1].data[selected_idx], header=self.hdu[1].header)
         return self.__class__(copy, quality_bitmask=self.quality_bitmask, targetid=self.targetid)
+
+    def __len__(self):
+        return len(self.time)
+
+    def __add__(self, other):
+        if isinstance(other, Quantity):
+            other = other.value
+        hdu = deepcopy(self.hdu)
+        hdu[1].data['FLUX'][self.quality_mask] += other
+        return type(self)(hdu, quality_bitmask=self.quality_bitmask)
+
+    def __mul__(self, other):
+        if isinstance(other, Quantity):
+            other = other.value
+        hdu = deepcopy(self.hdu)
+        hdu[1].data['FLUX'][self.quality_mask] *= other
+        hdu[1].data['FLUX_ERR'][self.quality_mask] *= other
+        return type(self)(hdu, quality_bitmask=self.quality_bitmask)
+
+    def __rtruediv__(self, other):
+        if isinstance(other, Quantity):
+            other = other.value
+        hdu = deepcopy(self.hdu)
+        hdu[1].data['FLUX'][self.quality_mask] /= other
+        hdu[1].data['FLUX_ERR'][self.quality_mask] /= other
+        return type(self)(hdu, quality_bitmask=self.quality_bitmask)
+
+    def __radd__(self, other):
+        return self.__add__(other)
+
+    def __sub__(self, other):
+        return self.__add__(-1 * other)
+
+    def __rsub__(self, other):
+        return (-1 * self).__add__(other)
+
+    def __rmul__(self, other):
+        return self.__mul__(other)
+
+    def __truediv__(self, other):
+        return self.__mul__(1. / other)
+
+    def __div__(self, other):
+        return self.__truediv__(other)
+
+    def __rdiv__(self, other):
+        return self.__rtruediv__(other)
+
+    @property
+    @deprecated("2.0", alternative="time", warning_type=LightkurveDeprecationWarning)
+    def astropy_time(self):
+        """Returns an AstroPy Time object for all good-quality cadences."""
+        return self.time
 
     @property
     def hdu(self):
         return self._hdu
 
     @hdu.setter
-    def hdu(self, value, keys=['FLUX', 'QUALITY']):
+    def hdu(self, value, keys=('FLUX', 'QUALITY')):
         """Verify the file format when setting the value of `self.hdu`.
 
         Raises a ValueError if `value` does not appear to be a Target Pixel File.
@@ -91,8 +180,7 @@ class TargetPixelFile(object):
                          for ttype in value[1].header['TTYPE*']])):
                 raise ValueError("File {} does not have a {} column, "
                                  "is this a target pixel file?".format(self.path, key))
-        else:
-            self._hdu = value
+        self._hdu = value
 
     def get_keyword(self, keyword, hdu=0, default=None):
         """Returns a header keyword value.
@@ -100,18 +188,39 @@ class TargetPixelFile(object):
         If the keyword is Undefined or does not exist,
         then return ``default`` instead.
         """
-        try:
-            kw = self.hdu[hdu].header[keyword]
-        except KeyError:
-            return default
-        if isinstance(kw, Undefined):
-            return default
-        return kw
+        return self.hdu[hdu].header.get(keyword, default)
 
     @property
+    @deprecated("2.0", alternative="get_header()",
+                warning_type=LightkurveDeprecationWarning)
     def header(self):
-        """Returns the header of the primary extension."""
+        """DEPRECATED. Please use ``get_header()`` instead."""
         return self.hdu[0].header
+
+    def get_header(self, ext=0):
+        """Returns the metadata embedded in the file.
+
+        Target Pixel Files contain embedded metadata headers spread across three
+        different FITS extensions:
+
+        1. The "PRIMARY" extension (``ext=0``) provides a metadata header
+           providing details on the target and its CCD position.
+        2. The "PIXELS" extension (``ext=1``) provides details on the
+           data column and their coordinate system (WCS).
+        3. The "APERTURE" extension (``ext=2``) provides details on the
+           aperture pixel mask and the expected coordinate system (WCS).
+
+        Parameters
+        ----------
+        ext : int or str
+            FITS extension name or number.
+
+        Returns
+        -------
+        header : `~astropy.io.fits.header.Header`
+            Header object containing metadata keywords.
+        """
+        return self.hdu[ext].header
 
     @property
     def ra(self):
@@ -160,9 +269,24 @@ class TargetPixelFile(object):
         return self.flux.shape
 
     @property
-    def time(self):
+    def time(self) -> Time:
         """Returns the time for all good-quality cadences."""
-        return self.hdu[1].data['TIME'][self.quality_mask]
+        time_values = self.hdu[1].data['TIME'][self.quality_mask]
+        # Some data products have missing time values;
+        # we need to set these to zero or `Time` cannot be instantiated.
+        time_values[~np.isfinite(time_values)] = 0
+
+        bjdrefi = self.hdu[1].header.get('BJDREFI')
+        if bjdrefi == 2454833:
+            time_format = 'bkjd'
+        elif bjdrefi == 2457000:
+            time_format = 'btjd'
+        else:
+            time_format = 'jd'
+
+        return Time(time_values,
+                    scale=self.hdu[1].header.get('TIMESYS', 'tdb').lower(),
+                    format=time_format)
 
     @property
     def cadenceno(self):
@@ -177,26 +301,37 @@ class TargetPixelFile(object):
     @property
     def nan_time_mask(self):
         """Returns a boolean mask flagging cadences whose time is `nan`."""
-        return ~np.isfinite(self.time)
+        return self.time.value == 0
 
     @property
-    def flux(self):
+    def flux(self) -> Quantity:
         """Returns the flux for all good-quality cadences."""
-        return self.hdu[1].data['FLUX'][self.quality_mask]
+        if self.get_header(1)['TUNIT5'] == 'e-/s':
+            unit = 'electron/s'
+        else:
+            unit = 'dimensionless'
+        return Quantity(self.hdu[1].data['FLUX'][self.quality_mask], unit=unit)
 
     @property
-    def flux_err(self):
+    def flux_err(self) -> Quantity:
         """Returns the flux uncertainty for all good-quality cadences."""
-        return self.hdu[1].data['FLUX_ERR'][self.quality_mask]
+        if self.get_header(1)['TUNIT6'] == 'e-/s':
+            unit = 'electron/s'
+        else:
+            unit = 'dimensionless'
+        return Quantity(self.hdu[1].data['FLUX_ERR'][self.quality_mask], unit=unit)
 
     @property
-    def flux_bkg(self):
+    def flux_bkg(self) -> Quantity:
         """Returns the background flux for all good-quality cadences."""
-        return self.hdu[1].data['FLUX_BKG'][self.quality_mask]
+        return Quantity(self.hdu[1].data['FLUX_BKG'][self.quality_mask],
+                        unit='electron/s')
 
     @property
-    def flux_bkg_err(self):
-        return self.hdu[1].data['FLUX_BKG_ERR'][self.quality_mask]
+    def flux_bkg_err(self) -> Quantity:
+        return Quantity(self.hdu[1].data['FLUX_BKG_ERR'][self.quality_mask],
+                        unit='electron/s')
+
 
     @property
     def quality(self):
@@ -204,13 +339,13 @@ class TargetPixelFile(object):
         return self.hdu[1].data['QUALITY'][self.quality_mask]
 
     @property
-    def wcs(self):
-        """Returns an astropy.wcs.WCS object with the World Coordinate System
+    def wcs(self) -> WCS:
+        """Returns an `astropy.wcs.WCS` object with the World Coordinate System
         solution for the target pixel file.
 
         Returns
         -------
-        w : astropy.wcs.WCS object
+        w : `astropy.wcs.WCS` object
             WCS solution
         """
         if 'MAST' in self.hdu[0].header['ORIGIN']:  # Is it a TessCut TPF?
@@ -240,20 +375,9 @@ class TargetPixelFile(object):
                             'NAXIS2': 'NAXIS2'}
             mywcs = {}
             for oldkey, newkey in wcs_keywords.items():
-                if (self.hdu[1].header[oldkey] != Undefined):
+                if self.hdu[1].header.get(oldkey, None) is not None:
                    mywcs[newkey] = self.hdu[1].header[oldkey]
             return WCS(mywcs)
-
-    @classmethod
-    def from_fits(cls, path_or_url, **kwargs):
-        """WARNING: THIS FUNCTION IS DEPRECATED AND WILL BE REMOVED VERY SOON.
-
-        Please use `lightkurve.open()` instead.
-        """
-        warnings.warn('`TargetPixelFile.from_fits()` is deprecated and will be '
-                      'removed soon, please use `lightkurve.open()` instead.',
-                      LightkurveWarning)
-        return cls(path_or_url, **kwargs)
 
     def get_coordinates(self, cadence='all'):
         """Returns two 3D arrays of RA and Dec values in decimal degrees.
@@ -299,7 +423,7 @@ class TargetPixelFile(object):
         ra = ra.reshape((pos_corr1_pix.shape[0], self.shape[1], self.shape[2]))
         dec = dec.reshape((pos_corr2_pix.shape[0], self.shape[1], self.shape[2]))
         ra, dec = ra[self.quality_mask], dec[self.quality_mask]
-        if cadence is not 'all':
+        if cadence != 'all':
             return ra[cadence], dec[cadence]
         return ra, dec
 
@@ -310,7 +434,7 @@ class TargetPixelFile(object):
         """
         attrs = {}
         for attr in dir(self):
-            if not attr.startswith('_'):
+            if not attr.startswith('_') and attr != "header" and attr != "astropy_time":
                 res = getattr(self, attr)
                 if callable(res):
                     continue
@@ -341,7 +465,7 @@ class TargetPixelFile(object):
                         attrs[attr]['print'] = '{}'.format(res)
                     attrs[attr]['type'] = 'str'
                 elif attr == 'wcs':
-                    attrs[attr]['print'] = 'astropy.wcs.wcs.WCS'.format(attr)
+                    attrs[attr]['print'] = 'astropy.wcs.wcs.WCS'
                     attrs[attr]['type'] = 'other'
                 else:
                     attrs[attr]['print'] = '{}'.format(type(res))
@@ -383,6 +507,13 @@ class TargetPixelFile(object):
         else:
             raise ValueError("Photometry method must be 'aperture' or 'prf'.")
 
+    def _resolve_default_aperture_mask(self, aperture_mask):
+        if isinstance(aperture_mask, str) and (aperture_mask == 'default'):
+            # returns 'pipeline', unless it is missing. Falls back to 'threshold'
+            return 'pipeline' if np.any(self.pipeline_mask) else 'threshold'
+        else:
+            return aperture_mask
+
     def _parse_aperture_mask(self, aperture_mask):
         """Parse the `aperture_mask` parameter as given by a user.
 
@@ -391,7 +522,8 @@ class TargetPixelFile(object):
 
         Parameters
         ----------
-        aperture_mask : array-like, 'pipeline', 'all', 'threshold', or None
+        aperture_mask : array-like, 'pipeline', 'all', 'threshold', 'default',
+        'background', or None
             A boolean array describing the aperture such that `True` means
             that the pixel will be used.
             If None or 'all' are passed, all pixels will be used.
@@ -399,12 +531,30 @@ class TargetPixelFile(object):
             will be returned.
             If 'threshold' is passed, all pixels brighter than 3-sigma above
             the median flux will be used.
+            If 'default' is passed, 'pipeline' mask will be used when available,
+            with 'threshold' as the fallback.
+            If 'background' is passed, all pixels fainter than the median flux
+            will be used.
+            If 'empty' is passed, no pixels will be used.
 
         Returns
         -------
         aperture_mask : ndarray
             2D boolean numpy array containing `True` for selected pixels.
         """
+        aperture_mask = self._resolve_default_aperture_mask(aperture_mask)
+
+        # If 'pipeline' mask is requested but missing, fall back to 'threshold'
+        if isinstance(aperture_mask, str) and (aperture_mask == 'pipeline') \
+           and ~np.any(self.pipeline_mask):
+           raise ValueError("_parse_aperture_mask: 'pipeline' is requested, but it is missing or empty.")
+
+        # Input validation
+        if hasattr(aperture_mask, 'shape') and (aperture_mask.shape != self.flux[0].shape):
+            raise ValueError("`aperture_mask` has shape {}, "
+                             "but the flux data has shape {}"
+                             "".format(aperture_mask.shape, self.flux[0].shape))
+
         with warnings.catch_warnings():
             # `aperture_mask` supports both arrays and string values; these yield
             # uninteresting FutureWarnings when compared, so let's ignore that.
@@ -415,8 +565,17 @@ class TargetPixelFile(object):
                 aperture_mask = self.pipeline_mask
             elif aperture_mask == 'threshold':
                 aperture_mask = self.create_threshold_mask()
-            elif ((aperture_mask & 2) == 2).any(): # Kepler-pipeline style
+            elif aperture_mask == 'background':
+                aperture_mask = ~self.create_threshold_mask(threshold=0,
+                                                            reference_pixel=None)
+            elif aperture_mask == 'empty':
+                aperture_mask = np.zeros((self.shape[1], self.shape[2]), dtype=bool)
+            elif np.issubdtype(aperture_mask.dtype, np.integer) and \
+                ((aperture_mask & 2) == 2).any():
+                # Kepler and TESS pipeline style integer flags
                 aperture_mask = (aperture_mask & 2) == 2
+            elif isinstance(aperture_mask.flat[0], (np.integer, np.float)):
+                aperture_mask = aperture_mask.astype(bool)
         self._last_aperture_mask = aperture_mask
         return aperture_mask
 
@@ -464,7 +623,7 @@ class TargetPixelFile(object):
         # Calculate the theshold value in flux units
         mad_cut = (1.4826 * MAD(vals) * threshold) + np.nanmedian(median_image)
         # Create a mask containing the pixels above the threshold flux
-        threshold_mask = np.nan_to_num(median_image) > mad_cut
+        threshold_mask = np.nan_to_num(median_image) >= mad_cut
         if (reference_pixel is None) or (not threshold_mask.any()):
             # return all regions above threshold
             return threshold_mask
@@ -481,33 +640,99 @@ class TargetPixelFile(object):
             closest_label = labels[closest_arg[0], closest_arg[1]]
             return labels == closest_label
 
-    def centroids(self, **kwargs):
-        """DEPRECATED: use `estimate_cdpp()` instead."""
-        warnings.warn('`TargetPixelFile.centroids()` is deprecated and will be '
-                      'removed in Lightkurve v1.0.0, '
-                      'please use `TargetPixelFile.estimate_centroids()` instead.',
-                      LightkurveWarning)
-        return self.estimate_centroids(**kwargs)
+    def estimate_background(self, aperture_mask='background'):
+        """Returns an estimate of the median background level in the FLUX column.
 
-    def estimate_centroids(self, aperture_mask='pipeline'):
-        """Returns centroid positions estimated using sample moments.
+        In the case of official Kepler and TESS Target Pixel Files, the
+        background estimates should be close to zero because these products
+        have already been background-subtracted by the pipeline (i.e. the values
+        in the `FLUX_BKG` column have been subtracted from the values in `FLUX`).
+        Background subtraction is often imperfect however, and this method aims
+        to allow users to estimate residual background signals using different
+        methods.
+
+        Target Pixel Files created by the MAST TESSCut service have
+        not been background-subtracted. For such products, or other community-
+        generated pixel files, this method provides a first-order estimate of
+        the background levels.
+
+        This method estimates the per-pixel background flux over time by
+        computing the median pixel value across the `aperture mask`.
 
         Parameters
         ----------
-        aperture_mask : array-like, 'pipeline', or 'all'
-            A boolean array describing the aperture such that `True` means
-            that the pixel will be used.
-            If None or 'all' are passed, all pixels will be used.
+        aperture_mask : 'background', 'all', or array-like
+            Which pixels should be used to estimate the background?
+            If None or 'all' are passed, all pixels in the pixel file will be
+            used.  If 'background' is passed, all pixels fainter than the
+            median flux will be used. Alternatively, users can pass a boolean
+            array describing the aperture mask such that `True` means that the
+            pixel will be used.
+
+        Returns
+        -------
+        lc : `LightCurve` object
+            Median background flux in units electron/second/pixel.
+        """
+        mask = self._parse_aperture_mask(aperture_mask)
+        # For each cadence, compute the median pixel flux across the background
+        simple_bkg = np.nanmedian(self.flux[:, mask], axis=1) / u.pixel
+        return LightCurve(time=self.time, flux=simple_bkg)
+
+    def estimate_centroids(self, aperture_mask='default', method='moments'):
+        """Returns the flux center of an object inside ``aperture_mask``.
+
+        Telescopes tend to smear out the light from a point-like star over
+        multiple pixels.  For this reason, it is common to estimate the position
+        of a star by computing the *geometric center* of its image.
+        Astronomers refer to this position as the *centroid* of the object,
+        i.e. the term *centroid* is often used as a generic synonym to refer
+        to the measured position of an object in a telescope exposure.
+
+        This function provides two methods to estimate the position of a star:
+
+        * `method='moments'` will compute the "center of mass" of the light
+          based on the 2D image moments of the pixels inside ``aperture_mask``.
+        * `method='quadratic'` will fit a two-dimensional, second-order
+          polynomial to the 3x3 patch of pixels centered on the brightest pixel
+          inside the ``aperture_mask``, and return the peak of that polynomial.
+          Following Vakili & Hogg 2016 (ArXiv:1610.05873, Section 3.2).
+
+        Parameters
+        ----------
+        aperture_mask : 'pipeline', 'threshold', 'all', 'default', or array-like
+            Which pixels contain the object to be measured, i.e. which pixels
+            should be used in the estimation?  If None or 'all' are passed,
+            all pixels in the pixel file will be used.
             If 'pipeline' is passed, the mask suggested by the official pipeline
             will be returned.
             If 'threshold' is passed, all pixels brighter than 3-sigma above
             the median flux will be used.
+            If 'default' is passed, 'pipeline' mask will be used when available,
+            with 'threshold' as the fallback.
+            Alternatively, users can pass a boolean array describing the
+            aperture mask such that `True` means that the pixel will be used.
+        method : 'moments' or 'quadratic'
+            Defines which method to use to estimate the centroids. 'moments'
+            computes the centroid based on the sample moments of the data.
+            'quadratic' fits a 2D polynomial to the data and returns the
+            coordinate of the peak of that polynomial.
 
         Returns
         -------
-        col_centr, row_centr : tuple
-            Arrays containing centroids for column and row at each cadence
+        columns, rows : `~astropy.units.Quantity`, `~astropy.units.Quantity`
+            Arrays containing the column and row positions for the centroid
+            for each cadence, or NaN for cadences where the estimation failed.
         """
+        method = validate_method(method, ['moments', 'quadratic'])
+        if method == 'moments':
+            return self._estimate_centroids_via_moments(aperture_mask=aperture_mask)
+        elif method == 'quadratic':
+            return self._estimate_centroids_via_quadratic(aperture_mask=aperture_mask)
+
+    def _estimate_centroids_via_moments(self, aperture_mask):
+        """Compute the "center of mass" of the light based on the 2D moments;
+        this is a helper method for `estimate_centroids()`."""
         aperture_mask = self._parse_aperture_mask(aperture_mask)
         yy, xx = np.indices(self.shape[1:]) + 0.5
         yy = self.row + yy
@@ -518,10 +743,178 @@ class TargetPixelFile(object):
             warnings.simplefilter("ignore", RuntimeWarning)
             col_centr = np.nansum(xx * aperture_mask * self.flux, axis=(1, 2)) / total_flux
             row_centr = np.nansum(yy * aperture_mask * self.flux, axis=(1, 2)) / total_flux
+        return col_centr*u.pixel, row_centr*u.pixel
+
+    def _estimate_centroids_via_quadratic(self, aperture_mask):
+        """Estimate centroids by fitting a 2D quadratic to the brightest pixels;
+        this is a helper method for `estimate_centroids()`."""
+        aperture_mask = self._parse_aperture_mask(aperture_mask)
+        col_centr, row_centr = [], []
+        for idx in range(len(self.time)):
+            col, row = centroid_quadratic(self.flux[idx], mask=aperture_mask)
+            col_centr.append(col)
+            row_centr.append(row)
+        # Finally, we add .5 to the result bellow because the convention is that
+        # pixels are centered at .5, 1.5, 2.5, ...
+        col_centr = np.asfarray(col_centr) + self.column + .5
+        row_centr = np.asfarray(row_centr) + self.row + .5
+        col_centr = Quantity(col_centr, unit='pixel')
+        row_centr = Quantity(row_centr, unit='pixel')
         return col_centr, row_centr
 
-    def plot(self, ax=None, frame=0, cadenceno=None, bkg=False, aperture_mask=None,
-             show_colorbar=True, mask_color='pink', style='lightkurve', **kwargs):
+    def _aperture_photometry(self, aperture_mask, centroid_method='moments'):
+        """Helper method for ``extract_aperture photometry``.
+
+        Returns
+        -------
+        flux, flux_err, centroid_col, centroid_row
+        """
+        # Validate the aperture mask
+        apmask = self._parse_aperture_mask(aperture_mask)
+        if apmask.sum() == 0:
+            log.warning('Warning: aperture mask contains zero pixels.')
+
+        # Estimate centroids
+        centroid_col, centroid_row = self.estimate_centroids(apmask, method=centroid_method)
+
+        # Estimate flux
+        flux = np.nansum(self.flux[:, apmask], axis=1)
+        # We use ``np.nansum`` above to be robust against a subset of pixels
+        # being NaN, however if *all* pixels are NaN, we propagate a NaN.
+        is_allnan = ~np.any(np.isfinite(self.flux[:, apmask]), axis=1)
+        flux[is_allnan] = np.nan
+
+        # Similarly, if *all* pixel values across the TPF are exactly zero,
+        # we propagate NaN (cf. #873 for an example of this happening)
+        is_allzero = np.all(self.flux == 0, axis=(1, 2))
+        flux[is_allzero] = np.nan
+
+        # Estimate flux_err
+        with warnings.catch_warnings():
+            # Ignore warnings due to negative errors
+            warnings.simplefilter("ignore", RuntimeWarning)
+            flux_err = np.nansum(self.flux_err[:, apmask]**2, axis=1)**0.5
+            is_allnan = ~np.any(np.isfinite(self.flux_err[:, apmask]), axis=1)
+            flux_err[is_allnan] = np.nan
+
+        if self.get_header(1)['TUNIT5'] == 'e-/s':
+            flux = Quantity(flux, unit='electron/s')
+            flux_err = Quantity(flux_err, unit='electron/s')
+
+        return flux, flux_err, centroid_col, centroid_row
+
+    def query_solar_system_objects(self, cadence_mask='outliers', radius=None,
+                                        sigma=3, cache=True, return_mask=False):
+        """Returns a list of asteroids or comets which affected the target pixel files.
+
+        Light curves of stars or galaxies are frequently affected by solar
+        system bodies (e.g. asteroids, comets, planets).  These objects can move
+        across a target's photometric aperture mask on time scales of hours to
+        days.  When they pass through a mask, they tend to cause a brief spike
+        in the brightness of the target.  They can also cause dips by moving
+        through a local background aperture mask (if any is used).
+
+        The artifical spikes and dips introduced by asteroids are frequently
+        confused with stellar flares, planet transits, etc.  This method helps
+        to identify false signals injects by asteroids by providing a list of
+        the solar system objects (name, brightness, time) that passed in the
+        vicinity of the target during the span of the light curve.
+
+        This method queries the `SkyBot API <http://vo.imcce.fr/webservices/skybot/>`_,
+        which returns a list of asteroids/comets/planets given a location, time,
+        and search cone.
+
+        Notes:
+        * This method will use the `ra` and `dec` properties of the `LightCurve`
+          object to determine the position of the search cone.
+        * The size of the search cone is 5 spacecraft pixels + TPF dimension by default. You
+          can change this by passing the `radius` parameter (unit: degrees).
+        * By default, this method will only search points in time during which the light
+          curve showed 3-sigma outliers in flux. You can override this behavior
+          and search for specific times by passing `cadence_mask`. See examples for details.
+
+        Parameters
+        ----------
+        cadence_mask : str, or boolean array with length of self.time
+            mask in time to select which frames or points should be searched for SSOs.
+            Default "outliers" will search for SSOs at points that are `sigma` from the mean.
+            "all" will search all cadences. Alternatively, pass a boolean array with values of "True"
+            for times to search for SSOs.
+        radius : optional, float
+            Radius to search for bodies. If None, will search for SSOs within 5 pixels of
+            all pixels in the TPF.
+        sigma : optional, float
+            If `cadence_mask` is set to `"outlier"`, `sigma` will be used to identify
+            outliers.
+        cache : optional, bool
+            If True will cache the search result in the astropy cache. Set to False
+            to request the search again.
+        return_mask: optional, bool
+            If True will return a boolean mask in time alongside the result
+
+        Returns
+        -------
+        result : pandas.DataFrame
+            DataFrame containing the list objects in frames that were identified to contain
+            SSOs.
+
+        Examples
+        --------
+        Find if there are SSOs affecting the target pixel file for the given time frame:
+
+            >>> df_sso = tpf.query_solar_system_objects(cadence_mask=(tpf.time.value >= 2014.1) & (tpf.time.value <= 2014.9))  # doctest: +SKIP
+
+        Find if there are SSOs affecting the target pixel file for all times, but it will be much slower:
+
+            >>> df_sso = tpf.query_solar_system_objects(cadence_mask='all')  # doctest: +SKIP
+
+        """
+
+        for attr in ['mission', 'ra', 'dec']:
+            if not hasattr(self, '{}'.format(attr)):
+                raise ValueError('Input does not have a `{}` attribute.'.format(attr))
+
+        location = self.mission.lower()
+
+        if isinstance(cadence_mask, str):
+            if cadence_mask == 'outliers':
+                aper = self.pipeline_mask
+                if aper.sum() == 0:
+                    aper = 'all'
+                lc = self.to_lightcurve(aperture_mask=aper)
+                cadence_mask = lc.remove_outliers(sigma=sigma, return_mask=True)[1]
+                # Avoid searching times with NaN flux; this is necessary because e.g.
+                # `remove_outliers` includes NaNs in its mask.
+                cadence_mask &= ~np.isnan(lc.flux)
+            elif cadence_mask == 'all':
+                cadence_mask = np.ones(len(self.time)).astype(bool)
+            else:
+                raise ValueError('invalid `cadence_mask` string argument')
+        elif isinstance(cadence_mask, collections.abc.Sequence):
+            cadence_mask = np.array(cadence_mask)
+        elif isinstance(cadence_mask, (bool)):
+            # for boundary case of a single element tuple, e.g., (True)
+            cadence_mask = np.array([cadence_mask])
+        elif not isinstance(cadence_mask, np.ndarray):
+            raise ValueError('Pass a cadence_mask method or a cadence_mask')
+
+        if (location == 'kepler') | (location == 'k2'):
+            pixel_scale = 4
+        if location == 'tess':
+            pixel_scale = 27
+
+        if radius == None:
+            radius = (2**0.5*(pixel_scale * (np.max(self.shape[1:]) + 5)))*u.arcsecond.to(u.deg)
+
+        res = _query_solar_system_objects(ra=self.ra, dec=self.dec, times=self.time.jd[cadence_mask],
+                                      location=location, radius=radius, cache=cache)
+        if return_mask:
+            return res, np.in1d(self.time.jd, res.epoch)
+        return res
+
+    def plot(self, ax=None, frame=0, cadenceno=None, bkg=False, column='FLUX', aperture_mask=None,
+             show_colorbar=True, mask_color='red', title=None, style='lightkurve',
+             **kwargs):
         """Plot the pixel data for a single frame (i.e. at a single time).
 
         The time can be specified by frame index number (`frame=0` will show the
@@ -529,7 +922,7 @@ class TargetPixelFile(object):
 
         Parameters
         ----------
-        ax : matplotlib.axes._subplots.AxesSubplot
+        ax : `~matplotlib.axes.Axes`
             A matplotlib axes object to plot into. If no axes is provided,
             a new one will be generated.
         frame : int
@@ -538,7 +931,10 @@ class TargetPixelFile(object):
             Alternatively, a cadence number can be provided.
             This argument has priority over frame number.
         bkg : bool
-            If True, background will be added to the pixel values.
+            If True and `column="FLUX"`, background will be added to the pixel values.
+        column : str
+            Choose the FITS data column to be plotted. May be one of ('FLUX',
+            'FLUX_ERR','FLUX_BKG','FLUX_BKG_ERR','COSMIC_RAYS','RAW_CNTS').
         aperture_mask : ndarray or str
             Highlight pixels selected by aperture_mask.
         show_colorbar : bool
@@ -554,7 +950,7 @@ class TargetPixelFile(object):
 
         Returns
         -------
-        ax : matplotlib.axes._subplots.AxesSubplot
+        ax : `~matplotlib.axes.Axes`
             The matplotlib axes object.
         """
         if style == 'lightkurve' or style is None:
@@ -567,28 +963,51 @@ class TargetPixelFile(object):
                                  "must be in the range {}-{}.".format(
                                      cadenceno, self.cadenceno[0], self.cadenceno[-1]))
         try:
-            if bkg and np.any(np.isfinite(self.flux_bkg[frame])):
-                pflux = self.flux[frame] + self.flux_bkg[frame]
+            if column == 'FLUX':
+                if bkg and np.any(np.isfinite(self.flux_bkg[frame])):
+                    data_to_plot = self.flux[frame] + self.flux_bkg[frame]
+                else:
+                    data_to_plot = self.flux[frame]
             else:
-                pflux = self.flux[frame]
+                data_to_plot = self.hdu[1].data[column][self.quality_mask][frame]
+        except KeyError:
+            raise ValueError("column must be one of the following: ('FLUX','FLUX_ERR',"
+                             "'FLUX_BKG','FLUX_BKG_ERR','COSMIC_RAYS','RAW_CNTS')")
         except IndexError:
             raise ValueError("frame {} is out of bounds, must be in the range "
                              "0-{}.".format(frame, self.shape[0]))
+
+        # Make list of preset colour labels
+        clabels = {'FLUX': 'Flux ($e^{-}s^{-1}$)',
+                   'FLUX_ERR': 'Flux Err. ($e^{-}s^{-1}$)',
+                   'FLUX_BKG': 'Background Flux ($e^{-}s^{-1}$)',
+                   'FLUX_BKG_ERR': 'Background Flux Err. ($e^{-}s^{-1}$)',
+                   'COSMIC_RAYS': 'Cosmic Ray Flux ($e^{-}s^{-1}$)',
+                   'RAW_CNTS': 'Raw Counts'}
+
         with plt.style.context(style):
-            img_title = 'Target ID: {}'.format(self.targetid)
-            img_extent = (self.column, self.column + self.shape[2],
-                          self.row, self.row + self.shape[1])
-            ax = plot_image(pflux, ax=ax, title=img_title, extent=img_extent,
-                            show_colorbar=show_colorbar, **kwargs)
+            if title is None:
+                title = 'Target ID: {}, Cadence: {}'.format(self.targetid, self.cadenceno[frame])
+            # We subtract -0.5 because pixel coordinates refer to the middle of
+            # a pixel, e.g. (col, row) = (10.0, 20.0) is a pixel center.
+            img_extent = (self.column - 0.5, self.column + self.shape[2] - 0.5,
+                          self.row - 0.5, self.row + self.shape[1] - 0.5)
+            ax = plot_image(data_to_plot, ax=ax, title=title, extent=img_extent,
+                            show_colorbar=show_colorbar, clabel=clabels.get(column, column),
+                            **kwargs)
             ax.grid(False)
+
+        # Overlay the aperture mask if given
         if aperture_mask is not None:
             aperture_mask = self._parse_aperture_mask(aperture_mask)
             for i in range(self.shape[1]):
                 for j in range(self.shape[2]):
                     if aperture_mask[i, j]:
-                        ax.add_patch(patches.Rectangle((j+self.column, i+self.row),
-                                                       1, 1, color=mask_color, fill=True,
-                                                       alpha=.6))
+                        rect = patches.Rectangle(
+                                        xy=(j+self.column-0.5, i+self.row-0.5),
+                                        width=1, height=1, color=mask_color,
+                                        fill=False, hatch='//')
+                        ax.add_patch(rect)
         return ax
 
     def to_fits(self, output_fn=None, overwrite=False):
@@ -597,8 +1016,9 @@ class TargetPixelFile(object):
             output_fn = "{}-targ.fits".format(self.targetid)
         self.hdu.writeto(output_fn, overwrite=overwrite, checksum=True)
 
-    def interact(self, notebook_url='localhost:8888', max_cadences=30000,
-                 aperture_mask='pipeline', exported_filename=None):
+    def interact(self, notebook_url='localhost:8888', max_cadences=200000,
+                 aperture_mask='default', exported_filename=None,
+                 transform_func=None, ylim_func=None, **kwargs):
         """Display an interactive Jupyter Notebook widget to inspect the pixel data.
 
         The widget will show both the lightcurve and pixel data.  By default,
@@ -613,7 +1033,7 @@ class TargetPixelFile(object):
 
         Parameters
         ----------
-        notebook_url: str
+        notebook_url : str
             Location of the Jupyter notebook page (default: "localhost:8888")
             When showing Bokeh applications, the Bokeh server must be
             explicitly configured to allow connections originating from
@@ -623,9 +1043,9 @@ class TargetPixelFile(object):
             properly. If no protocol is supplied in the URL, e.g. if it is
             of the form "localhost:8888", then "http" will be used.
         max_cadences : int
-            Raise a RuntimeError if the number of cadences shown is larger than
+            Print an error message if the number of cadences shown is larger than
             this value. This limit helps keep browsers from becoming unresponsive.
-        aperture_mask : array-like, 'pipeline', 'threshold' or 'all'
+        aperture_mask : array-like, 'pipeline', 'threshold', 'default', or 'all'
             A boolean array describing the aperture such that `True` means
             that the pixel will be used.
             If None or 'all' are passed, all pixels will be used.
@@ -633,24 +1053,56 @@ class TargetPixelFile(object):
             will be returned.
             If 'threshold' is passed, all pixels brighter than 3-sigma above
             the median flux will be used.
+            If 'default' is passed, 'pipeline' mask will be used when available,
+            with 'threshold' as the fallback.
         exported_filename: str
             An optional filename to assign to exported fits files containing
             the custom aperture mask generated by clicking on pixels in interact.
             The default adds a suffix '-custom-aperture-mask.fits' to the
             TargetPixelFile basename.
+        transform_func: function
+            A function that transforms the lightcurve.  The function takes in a
+            LightCurve object as input and returns a LightCurve object as output.
+            The function can be complex, such as detrending the lightcurve.  In this
+            way, the interactive selection of aperture mask can be evaluated after
+            inspection of the transformed lightcurve.  The transform_func is applied
+            before saving a fits file.  Default: None (no transform is applied).
+        ylim_func: function
+            A function that returns ylimits (low, high) given a LightCurve object.
+            The default is to return an expanded window around the 10-90th
+            percentile of lightcurve flux values.
+
+        Examples
+        --------
+        To select an aperture mask for V827 Tau::
+
+            >>> import lightkurve as lk
+            >>> tpf = lk.search_targetpixelfile("V827 Tau", mission="K2").download()  # doctest: +SKIP
+            >>> tpf.interact()  # doctest: +SKIP
+
+
+        To see the full y-axis dynamic range of your lightcurve and normalize
+        the lightcurve after each pixel selection::
+
+            >>> ylim_func = lambda lc: (0.0, lc.flux.max())  # doctest: +SKIP
+            >>> transform_func = lambda lc: lc.normalize()  # doctest: +SKIP
+            >>> tpf.interact(ylim_func=ylim_func, transform_func=transform_func)  # doctest: +SKIP
+
         """
         from .interact import show_interact_widget
         return show_interact_widget(self, notebook_url=notebook_url,
                                     max_cadences=max_cadences,
                                     aperture_mask=aperture_mask,
-                                    exported_filename=exported_filename)
+                                    exported_filename=exported_filename,
+                                    transform_func=transform_func,
+                                    ylim_func=ylim_func, **kwargs)
 
     def interact_sky(self, notebook_url='localhost:8888', magnitude_limit=18):
         """Display a Jupyter Notebook widget showing Gaia DR2 positions on top of the pixels.
 
         Parameters
         ----------
-        notebook_url: str
+        notebook_url : str
             Location of the Jupyter notebook page (default: "localhost:8888")
             When showing Bokeh applications, the Bokeh server must be
             explicitly configured to allow connections originating from
@@ -695,31 +1147,487 @@ class TargetPixelFile(object):
             return PLDCorrector(self)
 
 
-class KeplerTargetPixelFile(TargetPixelFile):
-    """Represents pixel data products created by NASA's Kepler pipeline.
+    def cutout(self, center=None, size=5):
+        """Cut a rectangle out of the Target Pixel File.
 
-    This class enables extraction of custom light curves and centroid positions.
+        This methods returns a new `TargetPixelFile` object containing a
+        rectangle of a given ``size`` cut out around a given ``center``.
+
+        Parameters
+        ----------
+        center : (int, int) tuple or `astropy.SkyCoord`
+            Center of the cutout.  If an (int, int) tuple is passed, it will be
+            interpreted as the (column, row) coordinates relative to
+            the bottom-left corner of the TPF.  If an `astropy.SkyCoord` is
+            passed then the sky coordinate will be used instead.
+            If `None` (default) then the center of the TPF will be used.
+        size : int or (int, int) tuple
+            Number of pixels to cut out. If a single integer is passed then
+            a square of that size will be cut. If a tuple is passed then a
+            rectangle with dimensions (column_size, row_size) will be cut.
+
+        Returns
+        -------
+        tpf : `lightkurve.TargetPixelFile` object
+            New and smaller Target Pixel File object containing only the data
+            cut out.
+        """
+        imshape = self.flux.shape[1:]
+
+        # Parse the user input (``center``) into an (x, y) coordinate
+        if center is None:
+            x, y = imshape[0]//2, imshape[1]//2
+        elif isinstance(center, SkyCoord):
+            x, y = self.wcs.world_to_pixel(center)
+        elif isinstance(center, (tuple, list, np.ndarray)):
+            x, y = center
+        col = int(x)
+        row = int(y)
+
+        # Parse the user input (``size``)
+        if isinstance(size, int):
+            s = (size/2, size/2)
+        elif isinstance(size, (tuple, list, np.ndarray)):
+            s = (size[0]/2, size[1]/2)
+
+        # Find the TPF edges
+        col_edges = np.asarray([np.max([0, col-s[0]]),
+                                np.min([col+s[0], imshape[1]])],
+                               dtype=int)
+        row_edges = np.asarray([np.max([0, row-s[1]]),
+                                np.min([row+s[1], imshape[0]])],
+                               dtype=int)
+
+        # Make a copy of the data extension
+        hdu = self.hdu[0].copy()
+
+        # Find the new object coordinates
+        r, d = self.get_coordinates(cadence=len(self.flux)//2)
+        hdu.header['RA_OBJ'] = np.nanmean(r[row_edges[0]:row_edges[1], col_edges[0]:col_edges[1]])
+        hdu.header['DEC_OBJ'] = np.nanmean(d[row_edges[0]:row_edges[1], col_edges[0]:col_edges[1]])
+
+        # Remove any KIC labels
+        labels = ['*MAG', 'PM*', 'GL*', 'PARALLAX', '*COLOR', 'TEFF',
+                  'LOGG', 'FEH', 'EBMINUSV', 'AV', "RADIUS", "TMINDEX"]
+        for label in labels:
+            if label in hdu.header:
+                hdu.header[label] = fits.card.Undefined()
+
+        keys = np.asarray([k for k in self.get_header().keys()])
+        if 'KEPLERID' in keys:
+            hdu.header['KEPLERID'] = '{}{}'.format(hdu.header['KEPLERID'], '_CUTOUT')
+        if 'TICID' in keys:
+            hdu.header['TICID'] = '{}{}'.format(hdu.header['TICID'], '_CUTOUT')
+
+        # HDUList
+        hdus = [hdu]
+
+        # Copy the header
+        hdr = deepcopy(self.hdu[1].header)
+
+        # Trim any columns that have the shape of the image, to be the new shape
+        data_columns = []
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            for idx, datacol in enumerate(self.hdu[1].columns):
+                # If the column is 3D
+                if (len(self.hdu[1].data[datacol.name].shape) == 3):
+                    # Make a copy, trim it and change the format
+                    datacol = deepcopy(datacol)
+                    datacol.array = datacol.array[:, row_edges[0]:row_edges[1], col_edges[0]:col_edges[1]]
+                    datacol._dim = '{}'.format(datacol.array.shape[1:]).replace(' ', '')
+                    datacol._dims = datacol.array.shape[1:]
+                    datacol._format = fits.column._ColumnFormat('{}{}'.format(np.product(datacol.array.shape[1:]),
+                                                                              datacol._format[-1]))
+                    data_columns.append(datacol)
+                    hdr['TDIM{}'.format(idx)] = '{}'.format(datacol.array.shape[1:]).replace(' ', '')
+                    hdr['TDIM9'] = '{}'.format(datacol.array.shape[1:]).replace(' ', '')
+                    hdr['TDIM13'] = '{}'.format((0, datacol.array.shape[1])).replace(' ', '')
+                else:
+                    data_columns.append(datacol)
+
+        # Get those coordinates sorted for the corner of the TPF and the WCS
+        hdr['1CRV*P'] = hdr['1CRV4P'] + col_edges[0]
+        hdr['2CRV*P'] = hdr['2CRV4P'] + row_edges[0]
+        hdr['1CRPX*'] = hdr['1CRPX4'] - col_edges[0]
+        hdr['2CRPX*'] = hdr['2CRPX4'] - row_edges[0]
+
+        # Make a table for the data
+        data_columns[-1]._dim = '{}'.format((0, int(data_columns[5]._dim.split(',')[1][:-1]))).replace(' ', '')
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            btbl = fits.BinTableHDU.from_columns(data_columns, header=hdr)
+
+        # Append it to the hdulist
+        hdus.append(btbl)
+
+        # Correct the aperture mask
+        hdu = self.hdu[2].copy()
+        ar = hdu.data
+        ar = ar[row_edges[0]:row_edges[1], col_edges[0]:col_edges[1]]
+        hdu.header['NAXIS1'] = ar.shape[0]
+        hdu.header['NAXIS2'] = ar.shape[1]
+        hdu.data = ar
+        hdus.append(hdu)
+
+        # Make a new tpf
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            newfits = fits.HDUList(hdus)
+        return self.__class__(newfits, quality_bitmask=self.quality_bitmask)
+
+
+    @staticmethod
+    def from_fits_images(images_flux, position, images_raw_cnts=None, images_flux_err=None,
+                         images_flux_bkg=None, images_flux_bkg_err=None, images_cosmic_rays=None,
+                         size=(11, 11), extension=1, target_id="unnamed-target", hdu0_keywords=None, **kwargs):
+        """Creates a new Target Pixel File from a set of images.
+
+        This method is intended to make it easy to cut out targets from
+        Kepler/K2 "superstamp" regions or TESS FFI images.
+
+        Parameters
+        ----------
+        images_flux : list of str, or list of fits.ImageHDU objects
+            Sorted list of FITS filename paths or ImageHDU objects to get
+            the flux data from.
+        position : astropy.SkyCoord
+            Position around which to cut out pixels.
+        images_raw_cnts : list of str, or list of fits.ImageHDU objects
+            Sorted list of FITS filename paths or ImageHDU objects to get
+            the raw counts data from.
+        images_flux_err : list of str, or list of fits.ImageHDU objects
+            Sorted list of FITS filename paths or ImageHDU objects to get
+            the flux error data from.
+        images_flux_bkg : list of str, or list of fits.ImageHDU objects
+            Sorted list of FITS filename paths or ImageHDU objects to get
+            the background data from.
+        images_flux_bkg_err : list of str, or list of fits.ImageHDU objects
+            Sorted list of FITS filename paths or ImageHDU objects to get
+            the background error data from.
+        images_cosmic_rays : list of str, or list of fits.ImageHDU objects
+            Sorted list of FITS filename paths or ImageHDU objects to get
+            the cosmic rays data from.
+        size : (int, int)
+            Dimensions (cols, rows) to cut out around `position`.
+        extension : int or str
+            If `images` is a list of filenames, provide the extension number
+            or name to use. This should be the same for all flux inputs
+            provided. Default: 1.
+        target_id : int or str
+            Unique identifier of the target to be recorded in the TPF.
+        hdu0_keywords : dict
+            Additional keywords to add to the first header file.
+        **kwargs : dict
+            Extra arguments to be passed to the `TargetPixelFile` constructor.
+
+        Returns
+        -------
+        tpf : TargetPixelFile
+            A new Target Pixel File assembled from the images.
+        """
+        len_images = len(images_flux)
+
+        if len_images == 0:
+            raise ValueError('One or more images must be passed.')
+        if not isinstance(position, SkyCoord):
+            raise ValueError('Position must be an astropy.coordinates.SkyCoord.')
+        if hdu0_keywords is None:
+            hdu0_keywords = {}
+
+        basic_keywords = ['MISSION', 'TELESCOP', 'INSTRUME', 'QUARTER',
+                          'CAMPAIGN', 'CHANNEL', 'MODULE', 'OUTPUT',
+                          'CAMERA', 'CCD', 'SECTOR']
+        carry_keywords = {}
+
+        # Define a helper function to accept images in a flexible way
+        def _open_image(img, extension):
+            if isinstance(img, fits.ImageHDU):
+                hdu = img
+            elif isinstance(img, fits.HDUList):
+                hdu = img[extension]
+            else:
+                hdu = fits.open(img)[extension]
+            return hdu
+
+        # Define a helper function to cutout images if not None
+        def _cutout_image(hdu, position, wcs_ref, size):
+            if hdu is None:
+                cutout_data = None
+                cutout_wcs = None
+            elif position is None:
+                cutout_data = hdu.data
+                cutout_wcs = hdu.wcs
+            else:
+                cutout = Cutout2D(hdu.data, position, wcs=wcs_ref,
+                                  size=size, mode='partial')
+                cutout_data = cutout.data
+                cutout_wcs = cutout.wcs
+            return cutout_data, cutout_wcs
+
+        # Set the default extension if unspecified
+        if extension is None:
+            extension = 0
+            if isinstance(images_flux[0], str) and images_flux[0].endswith("ffic.fits"):
+                extension = 1  # TESS FFIs have the image data in extension #1
+
+        # If no position is given, ensure the cut-out size matches the image size
+        if position is None:
+            size = _open_image(images_flux[0], extension).data.shape
+
+        # Find middle image to use as a WCS reference
+        try:
+            mid_hdu = _open_image(images_flux[int(len_images / 2) - 1], extension)
+
+            wcs_ref = WCS(mid_hdu)
+            column, row = wcs_ref.all_world2pix(
+                            np.asarray([[position.ra.deg], [position.dec.deg]]).T,
+                            0)[0]
+        except Exception as e:
+            raise e
+
+        # Create a factory and set default keyword values based on the middle image
+        factory = TargetPixelFileFactory(n_cadences=len_images,
+                                               n_rows=size[0],
+                                               n_cols=size[1],
+                                               target_id=target_id)
+
+        # Get some basic keywords
+        for kw in basic_keywords:
+            if kw in mid_hdu.header:
+                if not isinstance(mid_hdu.header[kw], Undefined):
+                    carry_keywords[kw] = mid_hdu.header[kw]
+        if ('MISSION' not in carry_keywords) and ('TELESCOP' in carry_keywords):
+            carry_keywords['MISSION'] = carry_keywords['TELESCOP']
+
+        allkeys = hdu0_keywords.copy()
+        allkeys.update(carry_keywords)
+
+        img_list = [images_raw_cnts, images_flux, images_flux_err, images_flux_bkg, images_flux_bkg_err, images_cosmic_rays]
+
+        for idx, img in tqdm(enumerate(images_flux), total=len_images):
+            # Open images if provided and get HDUs
+            hdu_list = [_open_image(i[idx], extension) if i is not None else None for i in img_list]
+
+            # Use the header in the flux image for each frame
+            hdu_idx = hdu_list[1].header
+
+            if idx == 0:  # Get default keyword values from the first flux image
+                factory.keywords = hdu_idx
+
+            # Get positional shift of the image compared to the reference WCS
+            wcs_current = WCS(hdu_idx)
+
+            column_current, row_current = wcs_current.all_world2pix(
+                np.asarray([[position.ra.deg], [position.dec.deg]]).T, 0)[0]
+            column_ref, row_ref = wcs_ref.all_world2pix(
+                np.asarray([[position.ra.deg], [position.dec.deg]]).T, 0)[0]
+
+            with warnings.catch_warnings():
+                # Using `POS_CORR1` as a header keyword violates the FITS
+                # standard for being too long, but we use it for consistency
+                # with the TPF column name.  Hence we ignore the warning.
+                warnings.simplefilter("ignore", AstropyWarning)
+                hdu_idx['POS_CORR1'] = column_current - column_ref
+                hdu_idx['POS_CORR2'] = row_current - row_ref
+
+            # Cutout (if neccessary) and get data
+            cutout_list = [_cutout_image(hdu, position, wcs_ref, size) for hdu in hdu_list]
+            # Flatten output list
+            cutout_list = [item for sublist in cutout_list for item in sublist]
+            raw_cnts, _, flux, wcs, flux_err, _, flux_bkg, _, flux_bkg_err, _, cosmic_rays, _ = cutout_list
+
+            factory.add_cadence(frameno=idx, raw_cnts=raw_cnts, flux=flux, flux_err=flux_err,
+                                flux_bkg=flux_bkg, flux_bkg_err=flux_bkg_err, cosmic_rays=cosmic_rays,
+                                header=hdu_idx)
+
+        ext_info = {}
+        ext_info['TFORM4'] = '{}J'.format(size[0] * size[1])
+        ext_info['TDIM4'] = '({},{})'.format(size[0], size[1])
+        ext_info.update(wcs.to_header(relax=True))
+
+        # TPF contains multiple data columns that require WCS
+        for m in [4, 5, 6, 7, 8, 9]:
+            if m > 4:
+                ext_info["TFORM{}".format(m)] = '{}E'.format(size[0] * size[1])
+                ext_info['TDIM{}'.format(m)] = '({},{})'.format(size[0], size[1])
+            # Compute the distance from the star to the TPF lower left corner
+            # That is approximately half the TPF size, with an adjustment factor if the star's pixel
+            #    position gets rounded up or not.
+            # The first int is there so that even sizes always round to one less than half of their value
+
+            half_tpfsize_col = int((size[0] - 1) / 2.) + (int(round(column)) - int(column)) * ((size[0] + 1) % 2)
+            half_tpfsize_row = int((size[1] - 1) / 2.) + (int(round(row)) - int(row)) * ((size[1] + 1) % 2)
+
+            ext_info['1CRV{}P'.format(m)] = int(round(column)) - half_tpfsize_col + factory.keywords['CRVAL1P'] - 1
+            ext_info['2CRV{}P'.format(m)] = int(round(row)) - half_tpfsize_row + factory.keywords['CRVAL2P'] - 1
+
+        return factory.get_tpf(hdu0_keywords=allkeys, ext_info=ext_info, **kwargs)
+
+
+    def plot_pixels(self, ax=None, periodogram=False, aperture_mask=None,
+                    show_flux=False, corrector_func=None, style='lightkurve',
+                    title=None, **kwargs):
+        """Show the light curve of each pixel in a single plot.
+
+        Note that all values are autoscaled and axis labels are not provided.
+        This utility is designed for by-eye inspection of signal morphology.
+
+        Parameters
+        ----------
+        ax : `~matplotlib.axes.Axes`
+            A matplotlib axes object to plot into. If no axes is provided,
+            a new one will be generated.
+        periodogram : bool
+            Default: False; if True, periodograms will be plotted, using normalized light curves.
+            Note that this keyword overrides normalized.
+        aperture_mask : ndarray or str
+            Highlight pixels selected by aperture_mask.
+            Only `pipeline`, `threshold`, or custom masks will be plotted.
+            `all` and None masks will be ignored.
+        show_flux : bool
+            Default: False; if True, shade pixels with frame 0 flux colour
+            Inspired by https://github.com/noraeisner/LATTE
+        corrector_func : function
+            Function that accepts and returns a `~lightkurve.lightcurve.LightCurve`.
+            This function is applied to each light curve in the collection
+            prior to stitching. The default is to normalize each light curve.
+        style : str
+            Path or URL to a matplotlib style file, or name of one of
+            matplotlib's built-in stylesheets (e.g. 'ggplot').
+            Lightkurve's custom stylesheet is used by default.
+        kwargs : dict
+            e.g. extra parameters to be passed to `lc.to_periodogram`.
+        """
+        if style == 'lightkurve' or style is None:
+            style = MPLSTYLE
+        if title is None:
+            title = f'Target ID: {self.targetid}'
+        if corrector_func is None:
+            corrector_func = lambda x: x.remove_outliers()
+        if show_flux:
+            cmap = plt.get_cmap()
+            norm = plt.Normalize(vmin=np.nanmin(self.flux[0].value),
+                                 vmax=np.nanmax(self.flux[0].value))
+        mask = self._parse_aperture_mask(aperture_mask)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=(RuntimeWarning, LightkurveWarning))
+
+            # get an aperture mask for each pixel
+            masks = np.zeros((self.shape[1]*self.shape[2], self.shape[1], self.shape[2]),
+                             dtype='bool')
+            for i in range(self.shape[1]*self.shape[2]):
+                masks[i][np.unravel_index(i, (self.shape[1], self.shape[2]))] = True
+
+            pixel_list = []
+            for j in range(self.shape[1]*self.shape[2]):
+                lc = self.to_lightcurve(aperture_mask=masks[j])
+                lc = corrector_func(lc)
+
+                if periodogram:
+                    try:
+                        pixel_list.append(lc.to_periodogram(**kwargs))
+                    except IndexError:
+                        pixel_list.append(None)
+                else:
+                    if len(lc.remove_nans().flux) == 0:
+                        pixel_list.append(None)
+                    else:
+                        pixel_list.append(lc)
+
+        with plt.style.context(style):
+            fig = plt.figure()
+            if ax is None:  # Configure axes if none is given
+                ax = plt.gca()
+                ax.get_xaxis().set_ticks([])
+                ax.get_yaxis().set_ticks([])
+                if periodogram:
+                    ax.set(title=title, xlabel='Frequency', ylabel='Power')
+                else:
+                    ax.set(title=title, xlabel='Time', ylabel='Flux')
+
+            gs = gridspec.GridSpec(self.shape[1], self.shape[2], wspace=0.01, hspace=0.01)
+
+            for k in range(self.shape[1]*self.shape[2]):
+                if pixel_list[k]:
+                    x, y = np.unravel_index(k, (self.shape[1], self.shape[2]))
+
+                    # Highlight aperture mask in red
+                    if aperture_mask is not None and mask[x,y]:
+                        rc = {"axes.linewidth": 2, "axes.edgecolor": 'red'}
+                    else:
+                        rc = {"axes.linewidth": 1}
+                    with plt.rc_context(rc=rc):
+                        gax = fig.add_subplot(gs[self.shape[1] - x - 1, y])
+
+                    # Determine background and foreground color
+                    if show_flux:
+                        gax.set_facecolor(cmap(norm(self.flux.value[0,x,y])))
+                        markercolor = "white"
+                    else:
+                        markercolor = "black"
+
+                    # Plot flux or periodogram
+                    if periodogram:
+                        gax.plot(pixel_list[k].frequency.value,
+                                 pixel_list[k].power.value,
+                                 marker='None', color=markercolor, lw=0.5)
+                    else:
+                        gax.plot(pixel_list[k].time.value,
+                                 pixel_list[k].flux.value,
+                                 marker='.', color=markercolor, ms=0.5, lw=0)
+
+                    gax.margins(y=.1, x=0)
+                    gax.set_xticklabels('')
+                    gax.set_yticklabels('')
+                    gax.set_xticks([])
+                    gax.set_yticks([])
+
+            fig.set_size_inches((y*1.5, x*1.5))
+
+        return ax
+
+
+class KeplerTargetPixelFile(TargetPixelFile):
+    """Class to read and interact with the pixel data products
+    ("Target Pixel Files") created by NASA's Kepler pipeline.
+
+    This class offers a user-friendly way to open a Kepler Target Pixel File
+    (TPF), access its meta data, visualize its contents, extract light curves
+    with custom aperture masks, estimate centroid positions, and more.
+
+    Please consult the `TargetPixelFile tutorial
+    <https://docs.lightkurve.org/tutorials/01-target-pixel-files.html>`_
+    in the online documentation for examples on using this class.
 
     Parameters
     ----------
-    path : str or `astropy.io.fits.HDUList`
-        Path to a Kepler Target Pixel (FITS) File or a `HDUList` object.
-    quality_bitmask : str or int
-        Bitmask (integer) which identifies the quality flag bitmask that should
-        be used to mask out bad cadences. If a string is passed, it has the
-        following meaning:
+    path : str or `~astropy.io.fits.HDUList`
+        Path to a Kepler Target Pixel file. Alternatively, you can pass a
+        `.HDUList` object, which is the AstroPy object returned by
+        the `astropy.io.fits.open` function.
+    quality_bitmask : "none", "default", "hard", "hardest", or int
+        Bitmask that should be used to ignore bad-quality cadences.
+        If a string is passed, it has the following meaning:
 
-            * "none": no cadences will be ignored (`quality_bitmask=0`).
+            * "none": no cadences will be ignored (equivalent to
+              ``quality_bitmask=0``).
             * "default": cadences with severe quality issues will be ignored
-              (`quality_bitmask=1130799`).
+              (equivalent to ``quality_bitmask=1130799``).
             * "hard": more conservative choice of flags to ignore
-              (`quality_bitmask=1664431`). This is known to remove good data.
-            * "hardest": removes all data that has been flagged
-              (`quality_bitmask=2096639`). This mask is not recommended.
+              (equivalent to ``quality_bitmask=1664431``).
+              This is known to remove good data.
+            * "hardest": remove all cadences that have one or more flags raised
+              (equivalent to ``quality_bitmask=2096639``). This mask is not
+              recommended because some quality flags can safely be ignored.
 
+        If an integer is passed, it will be used as a bitmask, i.e. it will
+        have the effect of removing cadences where
+        ``(tpf.hdu[1].data['QUALITY'] & quality_bitmask) > 0``.
         See the :class:`KeplerQualityFlags` class for details on the bitmasks.
-    kwargs : dict
-        Keyword arguments passed to `astropy.io.fits.open()`.
+    **kwargs : dict
+        Optional keyword arguments passed on to `astropy.io.fits.open`.
 
     References
     ----------
@@ -735,7 +1643,7 @@ class KeplerTargetPixelFile(TargetPixelFile):
                                 bitmask=quality_bitmask)
 
         # check to make sure the correct filetype has been provided
-        filetype = detect_filetype(self.header)
+        filetype = detect_filetype(self.hdu)
         if filetype == 'TessTargetPixelFile':
             warnings.warn("A TESS data product is being opened using the "
                           "`KeplerTargetPixelFile` class. "
@@ -748,68 +1656,9 @@ class KeplerTargetPixelFile(TargetPixelFile):
         # Use the KEPLERID keyword as the default targetid
         if self.targetid is None:
             try:
-                self.targetid = self.header['KEPLERID']
+                self.targetid = self.get_header()['KEPLERID']
             except KeyError:
                 pass
-
-    @staticmethod
-    def from_archive(target, cadence='long', quarter=None, month=None,
-                     campaign=None, quality_bitmask='default', **kwargs):
-        """WARNING: THIS FUNCTION IS DEPRECATED AND WILL BE REMOVED VERY SOON.
-        Use `lightkurve.search_targetpixelfile()` instead.
-
-        Parameters
-        ----------
-        target : str or int
-            KIC/EPIC ID or object name.
-        cadence : str
-            'long' or 'short'.
-        quarter, campaign : int, list of ints, or 'all'
-            Kepler Quarter or K2 Campaign number.
-        month : 1, 2, 3, list or 'all'
-            For Kepler's prime mission, there are three short-cadence
-            Target Pixel Files for each quarter, each covering one month.
-            Hence, if cadence='short' you need to specify month=1, 2, or 3.
-        quality_bitmask : str or int
-            Bitmask (integer) which identifies the quality flag bitmask that should
-            be used to mask out bad cadences. If a string is passed, it has the
-            following meaning:
-
-                * "none": no cadences will be ignored (`quality_bitmask=0`).
-                * "default": cadences with severe quality issues will be ignored
-                  (`quality_bitmask=1130799`).
-                * "hard": more conservative choice of flags to ignore
-                  (`quality_bitmask=1664431`). This is known to remove good data.
-                * "hardest": removes all data that has been flagged
-                  (`quality_bitmask=2096639`). This mask is not recommended.
-
-            See the :class:`KeplerQualityFlags` class for details on the bitmasks.
-        kwargs : dict
-            Keywords arguments passed to the constructor of
-            :class:`KeplerTargetPixelFile`.
-
-        Returns
-        -------
-        tpf : :class:`KeplerTargetPixelFile` or :class:`TargetPixelFileCollection` object.
-        """
-        warnings.warn('`TargetPixelFile.from_archive` is deprecated and will be removed soon, '
-                      'please use `lightkurve.search_targetpixelfile()` instead.',
-                      LightkurveWarning)
-        if os.path.exists(str(target)) or str(target).startswith('http'):
-            log.warning('Warning: from_archive() is not intended to accept a '
-                        'direct path, use KeplerTargetPixelFile(path) instead.')
-            return KeplerTargetPixelFile(target)
-        else:
-            from .search import search_targetpixelfile
-            sr = search_targetpixelfile(target, cadence=cadence,
-                                        quarter=quarter, month=month,
-                                        campaign=campaign)
-            if len(sr) == 1:
-                return sr.download(quality_bitmask=quality_bitmask, **kwargs)
-            elif len(sr) > 1:
-                return sr.download_all(quality_bitmask=quality_bitmask, **kwargs)
-            else:
-                raise ValueError("No target pixel files found that match the search criteria.")
 
     def __repr__(self):
         return('KeplerTargetPixelFile Object (ID: {})'.format(self.targetid))
@@ -847,11 +1696,6 @@ class KeplerTargetPixelFile(TargetPixelFile):
         return self.get_keyword('CHANNEL')
 
     @property
-    def astropy_time(self):
-        """Returns an AstroPy Time object for all good-quality cadences."""
-        return bkjd_to_astropy_time(bkjd=self.time)
-
-    @property
     def quarter(self):
         """Kepler quarter number. ('QUARTER' header keyword)"""
         return self.get_keyword('QUARTER')
@@ -866,12 +1710,12 @@ class KeplerTargetPixelFile(TargetPixelFile):
         """'Kepler' or 'K2'. ('MISSION' header keyword)"""
         return self.get_keyword('MISSION')
 
-    def extract_aperture_photometry(self, aperture_mask='pipeline'):
+    def extract_aperture_photometry(self, aperture_mask='default', centroid_method='moments'):
         """Returns a LightCurve obtained using aperture photometry.
 
         Parameters
         ----------
-        aperture_mask : array-like, 'pipeline', 'threshold' or 'all'
+        aperture_mask : array-like, 'pipeline', 'threshold', 'default', or 'all'
             A boolean array describing the aperture such that `True` means
             that the pixel will be used.
             If None or 'all' are passed, all pixels will be used.
@@ -879,6 +1723,11 @@ class KeplerTargetPixelFile(TargetPixelFile):
             will be returned.
             If 'threshold' is passed, all pixels brighter than 3-sigma above
             the median flux will be used.
+            If 'default' is passed, 'pipeline' mask will be used when available,
+            with 'threshold' as the fallback.
+        centroid_method : str, 'moments' or 'quadratic'
+            For the details on this arguments, please refer to the documentation
+            for `TargetPixelFile.estimate_centroids`.
 
         Returns
         -------
@@ -886,15 +1735,13 @@ class KeplerTargetPixelFile(TargetPixelFile):
             Array containing the summed flux within the aperture for each
             cadence.
         """
-        aperture_mask = self._parse_aperture_mask(aperture_mask)
-        if aperture_mask.sum() == 0:
-            log.warning('Warning: aperture mask contains zero pixels.')
-        centroid_col, centroid_row = self.estimate_centroids(aperture_mask)
-        # Ignore warnings related to zero or negative errors
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            flux_err = np.nansum(self.flux_err[:, aperture_mask]**2, axis=1)**0.5
+        # explicitly resolve default, so that the aperture_mask set in meta
+        # later will be the resolved one
+        aperture_mask = self._resolve_default_aperture_mask(aperture_mask)
 
+        flux, flux_err, centroid_col, centroid_row = \
+            self._aperture_photometry(aperture_mask=aperture_mask,
+                                      centroid_method=centroid_method)
         keys = {'centroid_col': centroid_col,
                 'centroid_row': centroid_row,
                 'quality': self.quality,
@@ -905,14 +1752,14 @@ class KeplerTargetPixelFile(TargetPixelFile):
                 'cadenceno': self.cadenceno,
                 'ra': self.ra,
                 'dec': self.dec,
-                'label': self.header['OBJECT'],
+                'label': self.get_keyword('OBJECT', default=self.targetid),
                 'targetid': self.targetid}
+        meta = {'APERTURE_MASK': aperture_mask}
         return KeplerLightCurve(time=self.time,
-                                time_format='bkjd',
-                                time_scale='tdb',
-                                flux=np.nansum(self.flux[:, aperture_mask], axis=1),
+                                flux=flux,
                                 flux_err=flux_err,
-                                **keys)
+                                **keys,
+                                meta=meta)
 
 
     def get_bkg_lightcurve(self, aperture_mask=None):
@@ -929,11 +1776,9 @@ class KeplerTargetPixelFile(TargetPixelFile):
                 'cadenceno': self.cadenceno,
                 'ra': self.ra,
                 'dec': self.dec,
-                'label': self.header['OBJECT'],
+                'label': self.get_keyword('OBJECT', default=self.targetid),
                 'targetid': self.targetid}
         return KeplerLightCurve(time=self.time,
-                                time_format='bkjd',
-                                time_scale='tdb',
                                 flux=np.nansum(self.flux_bkg[:, aperture_mask], axis=1),
                                 flux_err=flux_bkg_err,
                                 **keys)
@@ -961,12 +1806,12 @@ class KeplerTargetPixelFile(TargetPixelFile):
         # Set up the model
         if 'star_priors' not in kwargs:
             centr_col, centr_row = self.estimate_centroids()
-            star_priors = [StarPrior(col=GaussianPrior(mean=np.nanmedian(centr_col),
-                                                       var=np.nanstd(centr_col)**2),
-                                     row=GaussianPrior(mean=np.nanmedian(centr_row),
-                                                       var=np.nanstd(centr_row)**2),
-                                     flux=UniformPrior(lb=0.5*np.nanmax(self.flux[0]),
-                                                       ub=2*np.nansum(self.flux[0]) + 1e-10),
+            star_priors = [StarPrior(col=GaussianPrior(mean=np.nanmedian(centr_col.value),
+                                                       var=np.nanstd(centr_col.value)**2),
+                                     row=GaussianPrior(mean=np.nanmedian(centr_row.value),
+                                                       var=np.nanstd(centr_row.value)**2),
+                                     flux=UniformPrior(lb=0.5*np.nanmax(self.flux[0].value),
+                                                       ub=2*np.nansum(self.flux[0].value) + 1e-10),
                                      targetid=self.targetid)]
             kwargs['star_priors'] = star_priors
         if 'prfmodel' not in kwargs:
@@ -974,13 +1819,13 @@ class KeplerTargetPixelFile(TargetPixelFile):
         if 'background_prior' not in kwargs:
             if np.all(np.isnan(self.flux_bkg)):  # If TargetPixelFile has no background flux data
                 # Use the median of the lower half of flux as an estimate for flux_bkg
-                clipped_flux = np.ma.masked_where(self.flux > np.percentile(self.flux, 50),
-                                                  self.flux)
+                clipped_flux = np.ma.masked_where(self.flux.value > np.percentile(self.flux.value, 50),
+                                                  self.flux.value)
                 flux_prior = GaussianPrior(mean=np.ma.median(clipped_flux),
                                            var=np.ma.std(clipped_flux)**2)
             else:
-                flux_prior = GaussianPrior(mean=np.nanmedian(self.flux_bkg),
-                                           var=np.nanstd(self.flux_bkg)**2)
+                flux_prior = GaussianPrior(mean=np.nanmedian(self.flux_bkg.value),
+                                           var=np.nanstd(self.flux_bkg.value)**2)
             kwargs['background_prior'] = BackgroundPrior(flux=flux_prior)
         return TPFModel(**kwargs)
 
@@ -1025,144 +1870,7 @@ class KeplerTargetPixelFile(TargetPixelFile):
                 'targetid': self.targetid}
         return KeplerLightCurve(time=self.time,
                                 flux=lc.flux,
-                                time_format='bkjd',
-                                time_scale='tdb',
                                 **keys)
-
-    @staticmethod
-    def from_fits_images(images, position, size=(11, 11), extension=1,
-                         target_id="unnamed-target", hdu0_keywords={}, **kwargs):
-        """Creates a new Target Pixel File from a set of images.
-
-        This method is intended to make it easy to cut out targets from
-        Kepler/K2 "superstamp" regions or TESS FFI images.
-
-        Parameters
-        ----------
-        images : list of str, or list of fits.ImageHDU objects
-            Sorted list of FITS filename paths or ImageHDU objects to get
-            the data from.
-        position : astropy.SkyCoord
-            Position around which to cut out pixels.
-        size : (int, int)
-            Dimensions (cols, rows) to cut out around `position`.
-        extension : int or str
-            If `images` is a list of filenames, provide the extension number
-            or name to use. Default: 0.
-        target_id : int or str
-            Unique identifier of the target to be recorded in the TPF.
-        hdu0_keywords : dict
-            Additional keywords to add to the first header file.
-        **kwargs : dict
-            Extra arguments to be passed to the `KeplerTargetPixelFile` constructor.
-
-        Returns
-        -------
-        tpf : KeplerTargetPixelFile
-            A new Target Pixel File assembled from the images.
-        """
-        if len(images) == 0:
-            raise ValueError('One or more images must be passed.')
-        if not isinstance(position, SkyCoord):
-            raise ValueError('Position must be an astropy.coordinates.SkyCoord.')
-
-        basic_keywords = ['MISSION', 'TELESCOP', 'INSTRUME', 'QUARTER',
-                          'CAMPAIGN', 'CHANNEL', 'MODULE', 'OUTPUT']
-        carry_keywords = {}
-
-        # Define a helper function to accept images in a flexible way
-        def _open_image(img, extension):
-            if isinstance(img, fits.ImageHDU):
-                hdu = img
-            elif isinstance(img, fits.HDUList):
-                hdu = img[extension]
-            else:
-                hdu = fits.open(img)[extension]
-            return hdu
-
-        # Set the default extension if unspecified
-        if extension is None:
-            extension = 0
-            if isinstance(images[0], str) and images[0].endswith("ffic.fits"):
-                extension = 1  # TESS FFIs have the image data in extension #1
-
-        # If no position is given, ensure the cut-out size matches the image size
-        if position is None:
-            size = _open_image(images[0], extension).data.shape
-
-        # Find middle image to use as a WCS reference
-        try:
-            mid_hdu = _open_image(images[int(len(images) / 2) - 1], extension)
-            wcs_ref = WCS(mid_hdu)
-            column, row = wcs_ref.wcs_world2pix(
-                            np.asarray([[position.ra.deg], [position.dec.deg]]).T,
-                            0)[0]
-            column, row = int(column), int(row)
-        except Exception as e:
-            raise e
-            raise FactoryError("Images must have a valid WCS astrometric solution.")
-            return None
-
-        # Create a factory and set default keyword values based on the middle image
-        factory = KeplerTargetPixelFileFactory(n_cadences=len(images),
-                                               n_rows=size[0],
-                                               n_cols=size[1],
-                                               target_id=target_id)
-
-        # Get some basic keywords
-        for kw in basic_keywords:
-            if kw in mid_hdu.header:
-                if not isinstance(mid_hdu.header[kw], Undefined):
-                    carry_keywords[kw] = mid_hdu.header[kw]
-        if ('MISSION' not in carry_keywords) and ('TELESCOP' in carry_keywords):
-            carry_keywords['MISSION'] = carry_keywords['TELESCOP']
-
-        allkeys = hdu0_keywords.copy()
-        allkeys.update(carry_keywords)
-
-        for idx, img in tqdm(enumerate(images), total=len(images)):
-            hdu = _open_image(img, extension)
-
-            if idx == 0:  # Get default keyword values from the first image
-                factory.keywords = hdu.header
-
-
-            # Get positional shift of the image compared to the reference WCS
-            wcs_current = WCS(hdu.header)
-            column_current, row_current = wcs_current.wcs_world2pix(
-                          np.asarray([[position.ra.deg], [position.dec.deg]]).T,0)[0]
-            column_ref, row_ref = wcs_ref.wcs_world2pix(
-                          np.asarray([[position.ra.deg], [position.dec.deg]]).T,0)[0]
-
-            hdu.header['POS_CORR1'] = column_current - column_ref
-            hdu.header['POS_CORR2'] = row_current - row_ref
-
-            if position is None:
-                cutout = hdu
-            else:
-                cutout = Cutout2D(hdu.data, position, wcs=WCS(hdu.header),
-                                  size=size, mode='partial')
-            factory.add_cadence(frameno=idx, flux=cutout.data, header=hdu.header)
-
-        ext_info = {}
-        ext_info['TFORM4'] = '{}J'.format(size[0] * size[1])
-        ext_info['TDIM4'] = '({},{})'.format(size[0], size[1])
-        ext_info.update(cutout.wcs.to_header())
-
-        # TPF contains multiple data columns that require WCS
-        for m in [4, 5, 6, 7, 8, 9]:
-            if m > 4:
-                ext_info["TFORM{}".format(m)] = '{}E'.format(size[0] * size[1])
-                ext_info['TDIM{}'.format(m)] = '({},{})'.format(size[0], size[1])
-            # Compute location of TPF lower left corner
-            # Int statement contains modulus so that .5 values always round up.
-            # We cannot use numpy.round() as it rounds to the even number.
-            half_tpfsize_col = int((size[0] - 1) / 2 + (size[0] + 1) % 2)
-            half_tpfsize_row = int((size[1] - 1) / 2 + (size[1] + 1) % 2)
-            ext_info['1CRV{}P'.format(m)] = column - half_tpfsize_col + factory.keywords['CRVAL1P']
-            ext_info['2CRV{}P'.format(m)] = row - half_tpfsize_row + factory.keywords['CRVAL2P']
-
-        return factory.get_tpf(hdu0_keywords=allkeys, ext_info=ext_info, **kwargs)
 
 
 class FactoryError(Exception):
@@ -1170,16 +1878,19 @@ class FactoryError(Exception):
     pass
 
 
-class KeplerTargetPixelFileFactory(object):
-    """Class to create a KeplerTargetPixelFile."""
+class TargetPixelFileFactory(object):
+    """Class to create a TargetPixelFile."""
 
     def __init__(self, n_cadences, n_rows, n_cols, target_id="unnamed-target",
-                 keywords={}):
+                 keywords=None):
         self.n_cadences = n_cadences
         self.n_rows = n_rows
         self.n_cols = n_cols
         self.target_id = target_id
-        self.keywords = keywords
+        if keywords is None:
+            self.keywords = {}
+        else:
+            self.keywords = keywords
 
         # Initialize the 3D data structures
         self.raw_cnts = np.empty((n_cadences, n_rows, n_cols), dtype='int')
@@ -1208,10 +1919,12 @@ class KeplerTargetPixelFileFactory(object):
 
     def add_cadence(self, frameno, raw_cnts=None, flux=None, flux_err=None,
                     flux_bkg=None, flux_bkg_err=None, cosmic_rays=None,
-                    header={}):
+                    header=None):
         """Populate the data for a single cadence."""
         if frameno >= self.n_cadences:
             raise FactoryError('Can not add cadence {}, n_cadences set to {}'.format(frameno, self.n_cadences))
+        if header is None:
+            header = {}
 
         # 2D-data
         for col in ['raw_cnts', 'flux', 'flux_err', 'flux_bkg',
@@ -1248,14 +1961,27 @@ class KeplerTargetPixelFileFactory(object):
             warnings.warn('The factory-created TPF does not appear to contain '
                           'non-zero flux values.', LightkurveWarning)
 
-    def get_tpf(self, hdu0_keywords={}, ext_info={}, **kwargs):
-        """Returns a KeplerTargetPixelFile object."""
+    def get_tpf(self, hdu0_keywords=None, ext_info=None, **kwargs):
+        """Returns a TargetPixelFile object."""
+        if hdu0_keywords is None:
+            hdu0_keywords = {}
+        if ext_info is None:
+            ext_info = {}
         self._check_data()
-        return KeplerTargetPixelFile(self._hdulist(hdu0_keywords=hdu0_keywords,
-                                                   ext_info=ext_info),
-                                     **kwargs)
+        # Detect filetype
+        hdulist = self._hdulist(hdu0_keywords=hdu0_keywords, ext_info=ext_info)
+        filetype = detect_filetype(hdulist)
+        if filetype == 'TessTargetPixelFile':
+            tpf = TessTargetPixelFile(hdulist, **kwargs)
+        elif filetype == 'KeplerTargetPixelFile':
+            tpf = KeplerTargetPixelFile(hdulist, **kwargs)
+        else:
+            warnings.warn('Could not detect filetype as TESSTargetPixelFile or KeplerTargetPixelFile, '
+                          'returning generic TargetPixelFile instead.', LightkurveWarning)
+            tpf = TargetPixelFile(hdulist, **kwargs)
+        return tpf
 
-    def _hdulist(self, hdu0_keywords={}, ext_info={}):
+    def _hdulist(self, hdu0_keywords, ext_info):
         """Returns an astropy.io.fits.HDUList object."""
         return fits.HDUList([self._make_primary_hdu(hdu0_keywords=hdu0_keywords),
                              self._make_target_extension(ext_info=ext_info),
@@ -1267,7 +1993,7 @@ class KeplerTargetPixelFileFactory(object):
                                    "tpf-ext{}-header.txt".format(extension))
         return fits.Header.fromtextfile(template_fn)
 
-    def _make_primary_hdu(self, hdu0_keywords={}):
+    def _make_primary_hdu(self, hdu0_keywords):
         """Returns the primary extension (#0)."""
         hdu = fits.PrimaryHDU()
         # Copy the default keywords from a template file from the MAST archive
@@ -1277,10 +2003,10 @@ class KeplerTargetPixelFileFactory(object):
         # Override the defaults where necessary
         hdu.header['ORIGIN'] = "Unofficial data product"
         hdu.header['DATE'] = datetime.datetime.now().strftime("%Y-%m-%d")
-        hdu.header['TELESCOP'] = "Kepler"
-        hdu.header['CREATOR'] = "lightkurve.KeplerTargetPixelFileFactory"
+        hdu.header['CREATOR'] = "lightkurve.TargetPixelFileFactory"
         hdu.header['OBJECT'] = self.target_id
-        hdu.header['KEPLERID'] = self.target_id
+        if hdu.header['TELESCOP'] is not None and hdu.header['TELESCOP'] == "Kepler":
+            hdu.header['KEPLERID'] = self.target_id
         # Empty a bunch of keywords rather than having incorrect info
         for kw in ["PROCVER", "FILEVER", "CHANNEL", "MODULE", "OUTPUT",
                    "TIMVERSN", "CAMPAIGN", "DATA_REL", "TTABLEID",
@@ -1300,7 +2026,7 @@ class KeplerTargetPixelFileFactory(object):
                 hdu.header.append((kw, val))
         return hdu
 
-    def _make_target_extension(self, ext_info={}):
+    def _make_target_extension(self, ext_info):
         """Create the 'TARGETTABLES' extension (i.e. extension #1)."""
         # Turn the data arrays into fits columns and initialize the HDU
         coldim = '({},{})'.format(self.n_cols, self.n_rows)
@@ -1397,6 +2123,7 @@ class KeplerTargetPixelFileFactory(object):
         return hdu
 
 
+
 class TessTargetPixelFile(TargetPixelFile):
     """Represents pixel data products created by NASA's TESS pipeline.
 
@@ -1405,9 +2132,23 @@ class TessTargetPixelFile(TargetPixelFile):
     Parameters
     ----------
     path : str
-        Path to a Kepler Target Pixel (FITS) File.
-    quality_bitmask : str or int
-        Bitmask specifying quality flags of cadences that should be ignored.
+        Path to a TESS Target Pixel (FITS) File.
+    quality_bitmask : "none", "default", "hard", "hardest", or int
+        Bitmask that should be used to ignore bad-quality cadences.
+        If a string is passed, it has the following meaning:
+
+            * "none": no cadences will be ignored (`quality_bitmask=0`).
+            * "default": cadences with severe quality issues will be ignored
+              (`quality_bitmask=175`).
+            * "hard": more conservative choice of flags to ignore
+              (`quality_bitmask=7407`). This is known to remove good data.
+            * "hardest": removes all data that has been flagged
+              (`quality_bitmask=8191`). This mask is not recommended.
+
+        If an integer is passed, it will be used as a bitmask, i.e. it will
+        have the effect of removing cadences where
+        ``(tpf.hdu[1].data['QUALITY'] & quality_bitmask) > 0``.
+        See the :class:`KeplerQualityFlags` class for details on the bitmasks.
     kwargs : dict
         Keyword arguments passed to `astropy.io.fits.open()`.
     """
@@ -1425,7 +2166,7 @@ class TessTargetPixelFile(TargetPixelFile):
             self.quality_mask &= np.isfinite(self.hdu[1].data['TIME'])
 
         # check to make sure the correct filetype has been provided
-        filetype = detect_filetype(self.header)
+        filetype = detect_filetype(self.hdu)
         if filetype == 'KeplerTargetPixelFile':
             warnings.warn("A Kepler data product is being opened using the "
                           "`TessTargetPixelFile` class. "
@@ -1438,7 +2179,7 @@ class TessTargetPixelFile(TargetPixelFile):
         # Use the TICID keyword as the default targetid
         if self.targetid is None:
             try:
-                self.targetid = self.header['TICID']
+                self.targetid = self.get_header()['TICID']
             except KeyError:
                 pass
 
@@ -1469,35 +2210,37 @@ class TessTargetPixelFile(TargetPixelFile):
     def mission(self):
         return 'TESS'
 
-    @property
-    def astropy_time(self):
-        """Returns an AstroPy Time object for all good-quality cadences."""
-        return btjd_to_astropy_time(btjd=self.time)
-
-    def extract_aperture_photometry(self, aperture_mask='pipeline'):
-        """Performs aperture photometry.
+    def extract_aperture_photometry(self, aperture_mask='default', centroid_method='moments'):
+        """Returns a LightCurve obtained using aperture photometry.
 
         Parameters
         ----------
-        aperture_mask : array-like, 'pipeline', or 'all'
-            A boolean array describing the aperture such that `False` means
-            that the pixel will be masked out.
-            If the string 'all' is passed, all pixels will be used.
-            The default behaviour is to use the TESS pipeline mask.
+        aperture_mask : array-like, 'pipeline', 'threshold', 'default', or 'all'
+            A boolean array describing the aperture such that `True` means
+            that the pixel will be used.
+            If None or 'all' are passed, all pixels will be used.
+            If 'pipeline' is passed, the mask suggested by the official pipeline
+            will be returned.
+            If 'threshold' is passed, all pixels brighter than 3-sigma above
+            the median flux will be used.
+            If 'default' is passed, 'pipeline' mask will be used when available,
+            with 'threshold' as the fallback.
+        centroid_method : str, 'moments' or 'quadratic'
+            For the details on this arguments, please refer to the documentation
+            for `TargetPixelFile.estimate_centroids`.
+
         Returns
         -------
         lc : TessLightCurve object
             Contains the summed flux within the aperture for each cadence.
         """
-        aperture_mask = self._parse_aperture_mask(aperture_mask)
-        if aperture_mask.sum() == 0:
-            log.warning('Warning: aperture mask contains zero pixels.')
-        centroid_col, centroid_row = self.estimate_centroids(aperture_mask)
-        # Ignore warnings related to zero or negative errors
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            flux_err = np.nansum(self.flux_err[:, aperture_mask]**2, axis=1)**0.5
+        # explicitly resolve default, so that the aperture_mask set in meta
+        # later will be the resolved one
+        aperture_mask = self._resolve_default_aperture_mask(aperture_mask)
 
+        flux, flux_err, centroid_col, centroid_row = \
+            self._aperture_photometry(aperture_mask=aperture_mask,
+                                      centroid_method=centroid_method)
         keys = {'centroid_col': centroid_col,
                 'centroid_row': centroid_row,
                 'quality': self.quality,
@@ -1507,14 +2250,14 @@ class TessTargetPixelFile(TargetPixelFile):
                 'cadenceno': self.cadenceno,
                 'ra': self.ra,
                 'dec': self.dec,
-                'label': self.get_keyword('OBJECT'),
+                'label': self.get_keyword('OBJECT', default=self.targetid),
                 'targetid': self.targetid}
+        meta = {'APERTURE_MASK': aperture_mask}
         return TessLightCurve(time=self.time,
-                              time_format='btjd',
-                              time_scale='tdb',
-                              flux=np.nansum(self.flux[:, aperture_mask], axis=1),
+                              flux=flux,
                               flux_err=flux_err,
-                              **keys)
+                              **keys,
+                              meta=meta)
 
     def get_bkg_lightcurve(self, aperture_mask=None):
         aperture_mask = self._parse_aperture_mask(aperture_mask)
@@ -1529,11 +2272,9 @@ class TessTargetPixelFile(TargetPixelFile):
                 'cadenceno': self.cadenceno,
                 'ra': self.ra,
                 'dec': self.dec,
-                'label': self.header['OBJECT'],
+                'label': self.get_keyword('OBJECT', default=self.targetid),
                 'targetid': self.targetid}
         return TessLightCurve(time=self.time,
-                              time_format='btjd',
-                              time_scale='tdb',
                               flux=np.nansum(self.flux_bkg[:, aperture_mask], axis=1),
                               flux_err=flux_bkg_err,
                               **keys)

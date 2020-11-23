@@ -5,21 +5,20 @@ Lightkurve
 
 **Documentation: https://docs.lightkurve.org**
 
-|pypi-badge| |conda-badge| |azure-badge| |cov-badge| |doi-badge| |astropy-badge|
+|test-badge| |conda-badge| |pypi-badge| |pypi-downloads| |doi-badge| |astropy-badge|
 
-.. |pypi-badge| image:: https://img.shields.io/pypi/v/lightkurve.svg
-                :target: https://pypi.python.org/pypi/lightkurve
 .. |conda-badge| image:: https://img.shields.io/conda/vn/conda-forge/lightkurve.svg
                  :target: https://anaconda.org/conda-forge/lightkurve
-.. |azure-badge| image:: https://dev.azure.com/KeplerGO/Lightkurve/_apis/build/status/Lightkurve-PyTest?branchName=master
-                 :target: https://dev.azure.com/KeplerGO/Lightkurve/_build/latest?definitionId=1&branchName=master
-.. |cov-badge| image:: https://codecov.io/gh/KeplerGO/lightkurve/branch/master/graph/badge.svg
-              :target: https://codecov.io/gh/KeplerGO/lightkurve
+.. |pypi-badge| image:: https://img.shields.io/pypi/v/lightkurve.svg
+                :target: https://pypi.python.org/pypi/lightkurve
+.. |pypi-downloads| image:: https://pepy.tech/badge/lightkurve/month
+                :target: https://pepy.tech/project/lightkurve/month
+.. |test-badge| image:: https://github.com/KeplerGO/lightkurve/workflows/Lightkurve-tests/badge.svg
+                 :target: https://github.com/KeplerGO/lightkurve/actions?query=branch%3Amaster
 .. |astropy-badge| image:: https://img.shields.io/badge/powered%20by-AstroPy-orange.svg?style=flat
                    :target: http://www.astropy.org
 .. |doi-badge| image:: https://zenodo.org/badge/DOI/10.5281/zenodo.1181928.svg
-              :target: https://doi.org/10.5281/zenodo.1181928
-
+              :target: https://docs.lightkurve.org/about/citing.html             
 
 **Lightkurve** is a community-developed, open-source Python package which offers a beautiful and user-friendly way
 to analyze astronomical flux time series data,
@@ -62,6 +61,5 @@ Please read the citation instructions at `https://docs.lightkurve.org/about/citi
 
 Contact
 -------
-Lightkurve is an open source community project created by `the authors <AUTHORS.rst>`_ and supported by the
-`Kepler/K2 Guest Observer Office <https://keplerscience.arc.nasa.gov>`_.
-You can contact us via keplergo@mail.arc.nasa.gov.
+Lightkurve is an open source community project created by `the authors <AUTHORS.rst>`_.
+The best way to contact us is to `open an issue <https://github.com/KeplerGO/lightkurve/issues/new>`_ or to e-mail  tesshelp@bigbang.gsfc.nasa.gov.

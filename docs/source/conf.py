@@ -20,7 +20,14 @@ extensions = [
     'sphinx.ext.intersphinx',
     'nbsphinx',
     'numpydoc',
-    'sphinx_automodapi.automodapi']
+    'sphinx_automodapi.automodapi',
+    'sphinxcontrib.rawfiles']
+
+# Disable RequireJS because it creates a conflict with bootstrap.js.
+# This conflict breaks the navigation toggle button.
+# The exact consequence of disabling RequireJS is not understood
+# -- likely it means that notebook widgets may not work?
+nbsphinx_requirejs_path = ""
 
 numpydoc_show_class_members = False
 
@@ -50,7 +57,7 @@ author = 'Kepler/K2 Guest Observer Office'
 # built documents.
 #
 # The short X.Y version.
-version = lightkurve.__version__.split('.dev')[0]
+version = ".".join(lightkurve.__version__.split('.')[:2])
 # The full version, including alpha/beta/rc tags.
 release = lightkurve.__version__
 
@@ -92,8 +99,7 @@ nbsphinx_prolog = r"""
 """
 
 # -- Options for HTML output ----------------------------------------------
-html_theme = 'kurvian'
-html_theme_path = ['../']
+html_theme = 'amunra_sphinx_theme'
 
 html_theme_options = {
     "navbar_title": "Lightkurve v" + version,
@@ -103,28 +109,30 @@ html_theme_options = {
         ("API", "api/index"),
         ("About", "about/index"),
     ],
+    "github_link": "https://github.com/KeplerGO/Lightkurve",
+    "footer_text": """Created with ♥ by the Lightkurve collaboration.
+                      Please <a href="/about/citing.html">cite us</a> or
+                      <a href="https://github.com/KeplerGO/Lightkurve">join us on GitHub.</a>""",
+    "analytics_id": "UA-69171-9"
 }
 
 html_title = "Lightkurve"
 
 html_static_path = ['_static']
 
-sys.path += ['exts']
-extensions += ['sphinxcontrib_rawfiles']
-
-# Files we want to copy
-# CNAME tells GitHub the domain name to use for hosting the docs
-# .nojekyll prevents GitHub from hiding the `_static` dir
+# Raw files we want to copy using the sphinxcontrib-rawfiles extension:
+# - CNAME tells GitHub the domain name to use for hosting the docs
+# - .nojekyll prevents GitHub from hiding the `_static` dir
 rawfiles = ['CNAME', '.nojekyll']
 
 # Make sure text marked up `like this` will be interpreted as Python objects
 default_role = 'py:obj'
 
 # intersphinx enables links to classes/functions in the packages defined here:
-intersphinx_mapping = {'python': ('https://docs.python.org/', None),
-                       'numpy': ('http://docs.scipy.org/doc/numpy/', None),
-                       'scipy': ('http://docs.scipy.org/doc/scipy/reference', None),
-                       'matplotlib': ('http://matplotlib.sourceforge.net/', None),
-                       'pandas': ('http://pandas.pydata.org/pandas-docs/stable/', None),
+intersphinx_mapping = {'python': ('https://docs.python.org/3/', None),
+                       'numpy': ('https://docs.scipy.org/doc/numpy/', None),
+                       'scipy': ('https://docs.scipy.org/doc/scipy/reference', None),
+                       'matplotlib': ('https://matplotlib.org', None),
+                       'pandas': ('https://pandas.pydata.org/pandas-docs/stable/', None),
                        'oktopus': ('https://keplergo.github.io/oktopus', None),
-                       'astropy': ('http://docs.astropy.org/en/latest/', None)}
+                       'astropy': ('https://docs.astropy.org/en/latest/', None)}

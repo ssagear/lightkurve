@@ -1,58 +1,79 @@
 import pytest
-from astropy import units as u
 import numpy as np
+import matplotlib.pyplot as plt
 from numpy.testing import assert_almost_equal, assert_array_equal
+
+from astropy import units as u
+from astropy.time import Time
+from astropy.stats.bls import BoxLeastSquares
 
 from ..lightcurve import LightCurve
 from ..periodogram import Periodogram
+from ..utils import LightkurveWarning
 import sys
-
-
-bad_optional_imports = False
-try:
-    from astropy.stats.bls import BoxLeastSquares
-except ImportError:
-    bad_optional_imports = True
 
 
 def test_periodogram_basics():
     """Sanity check to verify that periodogram plotting works"""
     lc = LightCurve(time=np.arange(1000), flux=np.random.normal(1, 0.1, 1000),
                     flux_err=np.zeros(1000)+0.1)
+    lc = lc.normalize()
     pg = lc.to_periodogram()
     pg.plot()
+    plt.close()
     pg.plot(view='period')
+    plt.close()
     pg.show_properties()
     pg.to_table()
     str(pg)
+    lc[400:500] = np.nan
+    pg = lc.to_periodogram()
+
 
 def test_periodogram_normalization():
     """Tests the normalization options"""
     lc = LightCurve(time=np.arange(1000), flux=np.random.normal(1, 0.1, 1000),
-                    flux_err=np.zeros(1000)+0.1)
+                    flux_err=np.zeros(1000)+0.1, flux_unit='electron/second')
     # Test amplitude normalization and correct units
     pg = lc.to_periodogram(normalization='amplitude')
+    assert pg.power.unit == u.electron / u.second
+    pg = lc.normalize(unit='ppm').to_periodogram(normalization='amplitude')
     assert pg.power.unit == u.cds.ppm
 
     # Test PSD normalization and correct units
     pg = lc.to_periodogram(freq_unit=u.microhertz, normalization='psd')
+    assert pg.power.unit ==  (u.electron/u.second)**2 / u.microhertz
+    pg = lc.normalize(unit='ppm').to_periodogram(freq_unit=u.microhertz, normalization='psd')
     assert pg.power.unit == u.cds.ppm**2 / u.microhertz
+
+
+def test_periodogram_warnings():
+    """Tests if warnings are raised for non-normalized periodogram input"""
+    lc = LightCurve(time=np.arange(1000), flux=np.random.normal(1, 0.1, 1000),
+                    flux_err=np.zeros(1000)+0.1)
+    lc = lc.normalize(unit='ppm')
+    # Test amplitude normalization and correct units
+    pg = lc.to_periodogram(normalization='amplitude')
+    assert pg.power.unit == u.cds.ppm
+    pg = lc.to_periodogram(freq_unit=u.microhertz, normalization='psd')
+    assert pg.power.unit == u.cds.ppm**2 / u.microhertz
+
 
 def test_periodogram_units():
     """Tests whether periodogram has correct units"""
     # Fake, noisy data
     lc = LightCurve(time=np.arange(1000), flux=np.random.normal(1, 0.1, 1000),
-                    flux_err=np.zeros(1000)+0.1)
+                    flux_err=np.zeros(1000)+0.1, flux_unit='electron/second')
     p = lc.to_periodogram(normalization='amplitude')
     # Has units
     assert hasattr(p.frequency, 'unit')
 
     # Has the correct units
     assert p.frequency.unit == 1./u.day
-    assert p.power.unit == u.cds.ppm
+    assert p.power.unit == u.electron / u.second
     assert p.period.unit == u.day
     assert p.frequency_at_max_power.unit == 1./u.day
-    assert p.max_power.unit == u.cds.ppm
+    assert p.max_power.unit == u.electron / u.second
 
 
 def test_periodogram_can_find_periods():
@@ -61,7 +82,8 @@ def test_periodogram_can_find_periods():
     lc = LightCurve(time=np.arange(1000), flux=np.random.normal(1, 0.1, 1000),
                     flux_err=np.zeros(1000)+0.1)
     # Add a 100 day period signal
-    lc.flux *= np.sin((lc.time/float(lc.time.max())) * 20 * np.pi)
+    lc.flux += np.sin((lc.time.value/float(lc.time.value.max())) * 20 * np.pi)
+    lc = lc.normalize()
     p = lc.to_periodogram(normalization='amplitude')
     assert np.isclose(p.period_at_max_power.value, 100, rtol=1e-3)
 
@@ -71,6 +93,7 @@ def test_periodogram_slicing():
     # Fake, noisy data
     lc = LightCurve(time=np.arange(1000), flux=np.random.normal(1, 0.1, 1000),
                     flux_err=np.zeros(1000)+0.1)
+    lc = lc.normalize()
     p = lc.to_periodogram()
     assert len(p[0:200].frequency) == 200
 
@@ -97,6 +120,7 @@ def test_assign_periods():
     lc = LightCurve(time=np.arange(1000), flux=np.random.normal(1, 0.1, 1000),
                     flux_err=np.zeros(1000) + 0.1)
     periods = np.arange(1, 100) * u.day
+    lc = lc.normalize()
     p = lc.to_periodogram(period=periods)
     # Get around the floating point error
     assert np.isclose(np.sum(periods - p.period).value, 0, rtol=1e-14)
@@ -109,6 +133,7 @@ def test_bin():
     """Test if you can bin the periodogram."""
     lc = LightCurve(time=np.arange(1000), flux=np.random.normal(1, 0.1, 1000),
                     flux_err=np.zeros(1000) + 0.1)
+    lc = lc.normalize()
     p = lc.to_periodogram()
     assert len(p.bin(binsize=10, method='mean').frequency) == len(p.frequency)//10
     assert len(p.bin(binsize=10, method='median').frequency) == len(p.frequency)//10
@@ -121,6 +146,7 @@ def test_smooth():
     lc = LightCurve(time=np.arange(1000),
                     flux=np.random.normal(1, 0.1, 1000),
                     flux_err=np.zeros(1000)+0.1)
+    lc = lc.normalize()
     p = lc.to_periodogram(normalization='psd', freq_unit=u.microhertz)
     # Test boxkernel and logmedian methods
     assert all(p.smooth(method='boxkernel').frequency == p.frequency)
@@ -154,13 +180,13 @@ def test_smooth():
 
 
 
-
 def test_flatten():
     npts = 10000
     np.random.seed(12069424)
     lc = LightCurve(time=np.arange(npts),
                     flux=np.random.normal(1, 0.1, npts),
                     flux_err=np.zeros(npts)+0.1)
+    lc = lc.normalize()
     p = lc.to_periodogram(normalization='psd', freq_unit=1/u.day)
 
     # Check method returns equal frequency
@@ -177,24 +203,24 @@ def test_flatten():
     assert all(s.power == p.flatten().power)
     str(s)
     s.plot()
-
+    plt.close()
 
 def test_index():
     """Test if you can mask out periodogram
     """
     lc = LightCurve(time=np.arange(1000), flux=np.random.normal(1, 0.1, 1000),
                     flux_err=np.zeros(1000)+0.1)
+    lc = lc.normalize()
     p = lc.to_periodogram()
     mask = (p.frequency > 0.1*(1/u.day)) & (p.frequency < 0.2*(1/u.day))
     assert len(p[mask].frequency) == mask.sum()
 
-@pytest.mark.skipif(bad_optional_imports,
-                    reason="requires bokeh and astropy.stats.bls")
+
 def test_bls(caplog):
     ''' Test that BLS periodogram works and gives reasonable errors
     '''
-    lc = LightCurve(time=np.linspace(0, 10, 1000), flux=np.random.normal(1, 0.1, 1000),
-                    flux_err=np.zeros(1000)+0.1)
+    lc = LightCurve(time=np.linspace(0, 10, 200), flux=np.random.normal(100, 0.1, 200),
+                    flux_err=np.zeros(200)+0.1)
 
     # should be able to make a periodogram
     p = lc.to_periodogram(method='bls')
@@ -202,6 +228,7 @@ def test_bls(caplog):
     assert np.all([key in  dir(p) for key in keys])
 
     p.plot()
+    plt.close()
 
     # we should be able to specify some keywords
     lc.to_periodogram(method='bls', minimum_period=0.2, duration=0.1, maximum_period=0.5)
@@ -242,15 +269,14 @@ def test_bls(caplog):
     mask = p.get_transit_mask(1, 0.1, 0)
     assert isinstance(mask, np.ndarray)
     assert isinstance(mask[0], np.bool_)
-    assert mask.sum() > (~mask).sum()
+    assert mask.sum() < (~mask).sum()
 
     assert isinstance(p.period_at_max_power, u.Quantity)
     assert isinstance(p.duration_at_max_power, u.Quantity)
-    assert isinstance(p.transit_time_at_max_power, float)
-    assert isinstance(p.depth_at_max_power, float)
+    assert isinstance(p.transit_time_at_max_power, Time)
+    assert isinstance(p.depth_at_max_power, u.Quantity)
 
 
-@pytest.mark.skipif(bad_optional_imports, reason="requires astropy.stats.bls")
 def test_bls_period_recovery():
     """Can BLS Periodogram recover the period of a synthetic light curve?"""
     # Planet parameters
@@ -261,12 +287,12 @@ def test_bls_period_recovery():
     flux_err = 0.01
 
     # Create the synthetic light curve
-    time = np.arange(0, 100, 0.1)
+    time = np.arange(0, 20, 0.02)
     flux = np.ones_like(time)
     transit_mask = np.abs((time-transit_time+0.5*period) % period-0.5*period) < 0.5*duration
     flux[transit_mask] = 1.0 - depth
     flux += flux_err * np.random.randn(len(time))
-    synthetic_lc = LightCurve(time, flux)
+    synthetic_lc = LightCurve(time=time, flux=flux)
 
     # Can BLS recover the period?
     bls_period = synthetic_lc.to_periodogram("bls").period_at_max_power
@@ -290,28 +316,22 @@ def test_error_messages():
 
     # Can't specify period range and frequency range
     with pytest.raises(ValueError) as err:
-        lc.to_periodogram(max_frequency=0.1, min_period=10)
+        lc.to_periodogram(maximum_frequency=0.1, minimum_period=10)
 
     # Can't have a minimum frequency > maximum frequency
     with pytest.raises(ValueError) as err:
-        lc.to_periodogram(max_frequency=0.1, min_frequency=10)
-        assert err.value.args[0] == 'min_frequency cannot be larger than max_frequency'
+        lc.to_periodogram(maximum_frequency=0.1, minimum_frequency=10)
+    assert err.value.args[0] == 'minimum_frequency cannot be larger than maximum_frequency'
 
     # Can't have a minimum period > maximum period
     with pytest.raises(ValueError) as err:
-        lc.to_periodogram(max_period=0.1, min_period=10)
-        assert err.value.args[0] == 'min_period cannot be larger than max_period'
+        lc.to_periodogram(maximum_period=0.1, minimum_period=10)
+    assert err.value.args[0] == 'minimum_period cannot be larger than maximum_period'
 
     # Can't specify periods and frequencies
     with pytest.raises(ValueError) as err:
         lc.to_periodogram(frequency=np.arange(10), period=np.arange(10))
 
-    # Don't accept NaNs
-    with pytest.raises(ValueError) as err:
-        lc_with_nans = lc.copy()
-        lc_with_nans.flux[0] = np.nan
-        lc_with_nans.to_periodogram()
-    assert('Lightcurve contains NaN values.' in err.value.args[0])
 
     # No unitless periodograms
     with pytest.raises(ValueError) as err:
@@ -346,15 +366,14 @@ def test_error_messages():
     # Bad binning method
     with pytest.raises(ValueError) as err:
         Periodogram([0, 1, 2]*u.Hz, [1, 1, 1]*u.K).bin(method='not-implemented')
-    assert("is not a valid method, must be 'mean' or 'median'" in err.value.args[0])
+    assert("method 'not-implemented' is not supported" in err.value.args[0])
 
     # Bad smooth method
     with pytest.raises(ValueError) as err:
         Periodogram([0, 1, 2]*u.Hz, [1, 1, 1]*u.K).smooth(method="not-implemented")
-    assert("parameter must be one of 'boxkernel' or 'logmedian'" in err.value.args[0])
+    assert("method 'not-implemented' is not supported" in err.value.args[0])
 
 
-@pytest.mark.skipif(bad_optional_imports, reason="requires astropy.stats.bls")
 def test_bls_period():
     """Regression test for #514."""
     lc = LightCurve(time=[1, 2, 3], flux=[4, 5, 6])

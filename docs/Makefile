@@ -2,7 +2,7 @@
 #
 
 # You can set these variables from the command line.
-SPHINXOPTS    =
+SPHINXOPTS    = -j auto
 SPHINXBUILD   = sphinx-build
 SPHINXPROJ    = lightkurve
 SOURCEDIR     = source
@@ -26,3 +26,9 @@ notebooks:
 upload:
 	ghp-import -m "Update docs" $(BUILDDIR)/html
 	git push origin gh-pages
+
+clean:
+	# Remove previous output
+	-rm -rf $(BUILDDIR)/*
+	# Force autogenerating the API docs
+	-rm source/api/lightkurve.*

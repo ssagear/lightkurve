@@ -1,20 +1,18 @@
-from __future__ import division, print_function
-
-import numpy as np
-from numpy.testing import assert_almost_equal
-from astropy.io import fits
 import pytest
 import warnings
-import os
+
+import numpy as np
+from numpy.testing import assert_almost_equal, assert_array_equal
 
 from ..utils import KeplerQualityFlags, TessQualityFlags
 from ..utils import module_output_to_channel, channel_to_module_output
-from ..utils import running_mean
 from ..utils import LightkurveWarning
-from ..utils import detect_filetype
+from ..utils import running_mean, validate_method
+from ..utils import bkjd_to_astropy_time, btjd_to_astropy_time
+from ..utils import centroid_quadratic
+from ..utils import show_citation_instructions
 from ..lightcurve import LightCurve
 
-from .. import PACKAGEDIR
 
 def test_channel_to_module_output():
     assert channel_to_module_output(1) == (2, 1)
@@ -40,6 +38,7 @@ def test_running_mean():
     assert_almost_equal(running_mean([1, 2, 3], window_size=1), [1, 2, 3])
     assert_almost_equal(running_mean([1, 2, 3], window_size=2), [1.5, 2.5])
     assert_almost_equal(running_mean([2, 2, 2], window_size=3), [2])
+    assert_almost_equal(running_mean([3, 4, 5], window_size=20), [4])
 
 
 def test_quality_flag_decoding_kepler():
@@ -64,6 +63,23 @@ def test_quality_flag_decoding_tess():
         == [flags[3][1], flags[4][1], flags[5][1]]
 
 
+def test_quality_flag_decoding_quantity_object():
+    """Can a QUALITY flag that is a astropy quantity object be parsed correctly?
+
+    This is a regression test for https://github.com/KeplerGO/lightkurve/issues/804
+    """
+    from astropy.units.quantity import Quantity
+    flags = list(TessQualityFlags.STRINGS.items())
+    for key, value in flags:
+        assert TessQualityFlags.decode(Quantity(key, dtype='int32'))[0] == value
+    # Can we recover combinations of flags?
+    assert TessQualityFlags.decode(Quantity(flags[5][0], dtype='int32') + \
+        Quantity(flags[7][0], dtype='int32')) == [flags[5][1], flags[7][1]]
+    assert TessQualityFlags.decode(Quantity(flags[3][0], dtype='int32') + \
+        Quantity(flags[4][0], dtype='int32') + Quantity(flags[5][0], dtype='int32')) \
+        == [flags[3][1], flags[4][1], flags[5][1]]
+
+
 def test_quality_mask():
     """Can we create a quality mask using KeplerQualityFlags?"""
     quality = np.array([0, 0, 1])
@@ -78,6 +94,7 @@ def test_quality_mask():
     assert "not supported" in err.value.args[0]
 
 
+@pytest.mark.xfail  # Lightkurve v2.x no longer support NaNs in time values
 def test_lightkurve_warning():
     """Can we ignore Lightkurve warnings?"""
     with warnings.catch_warnings(record=True) as warns:
@@ -87,9 +104,67 @@ def test_lightkurve_warning():
         lc = LightCurve(time=time, flux=flux)
         assert len(warns) == 0
 
-def test_detect_filetype():
-    """Can we detect the correct filetype?"""
-    k2_path = os.path.join(PACKAGEDIR, "tests", "data", "test-tpf-star.fits")
-    tess_path = os.path.join(PACKAGEDIR, "tests", "data", "tess25155310-s01-first-cadences.fits.gz")
-    assert detect_filetype(fits.open(k2_path)[0].header) == 'KeplerTargetPixelFile'
-    assert detect_filetype(fits.open(tess_path)[0].header) == 'TessTargetPixelFile'
+
+def test_validate_method():
+    assert validate_method("foo", ["foo", "bar"]) == "foo"
+    assert validate_method("FOO", ["foo", "bar"]) == "foo"
+    with pytest.raises(ValueError):
+          validate_method("foo", ["bar"])
+
+
+def test_import():
+    """Regression test for #605; `lk.utils` resolved to `lk.seismology.utils`"""
+    from .. import utils
+    assert hasattr(utils, "btjd_to_astropy_time")
+
+
+def test_btjd_bkjd_input():
+    """Regression test for #607: are the bkjd/btjd functions tolerant?"""
+    # Kepler
+    assert bkjd_to_astropy_time(0).jd[0] == 2454833.
+    for user_input in [[0], np.array([0])]:
+        assert_array_equal(bkjd_to_astropy_time(user_input).jd, np.array([2454833.]))
+    # TESS
+    assert btjd_to_astropy_time(0).jd[0] == 2457000.
+    for user_input in [[0], np.array([0])]:
+        assert_array_equal(btjd_to_astropy_time(user_input).jd, np.array([2457000.]))
+
+
+def test_centroid_quadratic():
+    """Test basic operation of the quadratic centroiding function."""
+    # Single bright pixel in the center
+    data = np.ones((9, 9))
+    data[2, 5] = 10
+    col, row = centroid_quadratic(data)
+    assert np.isclose(row, 2) & np.isclose(col, 5)
+
+    # Two equally-bright pixels side by side
+    data = np.zeros((9, 9))
+    data[5, 1] = 5
+    data[5, 2] = 5
+    col, row = centroid_quadratic(data)
+    assert np.isclose(row, 5) & np.isclose(col, 1.5)
+
+
+def test_centroid_quadratic_robustness():
+    """Test quadratic centroids in edge cases; regression test for #610."""
+    # Brightest pixel in upper left
+    data = np.zeros((5, 5))
+    data[0, 0] = 1
+    centroid_quadratic(data)
+
+    # Brightest pixel in bottom right
+    data = np.zeros((5, 5))
+    data[-1, -1] = 1
+    centroid_quadratic(data)
+
+    # Data contains a NaN
+    data = np.zeros((5, 5))
+    data[0, 0] = np.nan
+    data[-1, -1] = 10
+    col, row = centroid_quadratic(data)
+    assert np.isfinite(col) & np.isfinite(row)
+
+
+def test_show_citation_instructions():
+    show_citation_instructions()

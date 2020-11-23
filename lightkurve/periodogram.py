@@ -4,6 +4,7 @@ from __future__ import division, print_function
 import copy
 import logging
 import math
+import re
 import warnings
 
 import numpy as np
@@ -14,15 +15,20 @@ from astropy.table import Table
 from astropy import units as u
 from astropy.units import cds
 from astropy.convolution import convolve, Box1DKernel
+from astropy.time import Time
 
 # LombScargle was moved from astropy.stats to astropy.timeseries in AstroPy v3.2
 try:
     from astropy.timeseries import LombScargle
+    from astropy.timeseries import implementations #for .main._is_regular
 except ImportError:
     from astropy.stats import LombScargle
+    from astropy.stats.lombscargle import implementations
+
 
 from . import MPLSTYLE
-from .utils import LightkurveWarning
+from .utils import LightkurveWarning, validate_method
+from .lightcurve import LightCurve
 
 log = logging.getLogger(__name__)
 
@@ -34,26 +40,26 @@ class Periodogram(object):
 
     The Periodogram class represents a power spectrum, with values of
     frequency on the x-axis (in any frequency units) and values of power on the
-    y-axis (in units of ppm^2 / [frequency units]).
+    y-axis (in units of flux^2 / [frequency units]).
 
     Attributes
     ----------
-    frequency : `astropy.units.Quantity` object
-        Array of frequencies with associated astropy unit.
-    power : `astropy.units.Quantity` object
-        Array of power-spectral-densities. The Quantity array must have units
-        of `ppm^2 / freq_unit`, where freq_unit is the unit of the frequency
+    frequency : `~astropy.units.Quantity`
+        Array of frequencies as an AstroPy Quantity object.
+    power : `~astropy.units.Quantity`
+        Array of power-spectral-densities. The Quantity must have units of
+        `flux^2 / freq_unit`, where freq_unit is the unit of the frequency
         attribute.
-    nyquist : float, optional
+    nyquist : float
         The Nyquist frequency of the lightcurve. In units of freq_unit, where
         freq_unit is the unit of the frequency attribute.
-    label : str, optional
+    label : str
         Human-friendly object label, e.g. "KIC 123456789".
-    targetid : str, optional
+    targetid : str
         Identifier of the target.
     default_view : "frequency" or "period"
         Should plots be shown in frequency space or period space by default?
-    meta : dict, optional
+    meta : dict
         Free-form metadata associated with the Periodogram.
     """
     def __init__(self, frequency, power, nyquist=None, label=None,
@@ -88,12 +94,20 @@ class Periodogram(object):
         """
         if view is None and hasattr(self, 'default_view'):
             view = self.default_view
-        allowed_views = ["frequency", "period"]
-        if view not in allowed_views:
-            raise ValueError(("'{}' is an invalid value for view, "
-                              "allowed values are: {}.")
-                             .format(view, allowed_views))
-        return view
+        return validate_method(view, ["frequency", "period"])
+
+    def _is_evenly_spaced(self):
+        """Returns true if the values in ``frequency`` are evenly spaced.
+
+        This helper method exists because some features, such as ``smooth()``,
+        ``estimate_numax()``, and ``estimate_deltanu()``, require a grid of
+        evenly-spaced frequencies.
+        """
+        # verify that the first differences are all equal
+        freqdiff = np.diff(self.frequency.value)
+        if np.allclose(freqdiff[0], freqdiff):
+            return True
+        return False
 
     @property
     def period(self):
@@ -136,8 +150,7 @@ class Periodogram(object):
         # Input validation
         if binsize < 1:
             raise ValueError('binsize must be larger than or equal to 1')
-        if method not in ('mean', 'median'):
-            raise ValueError("{} is not a valid method, must be 'mean' or 'median'.".format(method))
+        method = validate_method(method, ['mean', 'median'])
 
         m = int(len(self.power) / binsize)  # length of the binned arrays
         if method == 'mean':
@@ -206,10 +219,7 @@ class Periodogram(object):
             Returns a new `Periodogram` object in which the power spectrum
             has been smoothed.
         """
-        # Input validation
-        if method not in ('boxkernel', 'logmedian'):
-            raise ValueError("the `method` parameter must be one of "
-                             "'boxkernel' or 'logmedian'.")
+        method = validate_method(method, ['boxkernel', 'logmedian'])
 
         if method == 'boxkernel':
             if filter_width <= 0.:
@@ -222,11 +232,11 @@ class Periodogram(object):
                                  "frequency units.")
 
             # Check to see if we have a grid of evenly spaced periods instead.
-            fs = np.mean(np.diff(self.frequency))
-            if not np.isclose(np.median(np.diff(self.frequency.value)), fs.value):
+            if not self._is_evenly_spaced():
                 raise ValueError("the 'boxkernel' method requires the periodogram "
                                  "to have a grid of evenly spaced frequencies.")
 
+            fs = np.mean(np.diff(self.frequency))
             box_kernel = Box1DKernel(math.ceil((filter_width/fs).value))
             smooth_power = convolve(self.power.value, box_kernel)
             smooth_pg = self.copy()
@@ -260,7 +270,7 @@ class Periodogram(object):
         ----------
         scale: str
             Set x,y axis to be "linear" or "log". Default is linear.
-        ax : matplotlib.axes._subplots.AxesSubplot
+        ax : `~matplotlib.axes.Axes`
             A matplotlib axes object to plot into. If no axes is provided,
             a new one will be generated.
         xlabel : str
@@ -282,7 +292,7 @@ class Periodogram(object):
 
         Returns
         -------
-        ax : matplotlib.axes._subplots.AxesSubplot
+        ax : `~matplotlib.axes.Axes`
             The matplotlib axes object.
         """
         if isinstance(unit, u.quantity.Quantity):
@@ -298,10 +308,14 @@ class Periodogram(object):
         if style is None or style == 'lightkurve':
             style = MPLSTYLE
         if ylabel is None:
-            if self.power.unit == cds.ppm:
-                ylabel = "Amplitude [{}]".format(self.power.unit.to_string('latex'))
-            else:
-                ylabel = "Power Spectral Density [{}]".format(self.power.unit.to_string('latex'))
+            ylabel = "Power"
+            if self.power.unit.to_string() != '':
+                unit_label = self.power.unit.to_string('latex')
+                # The line below is a workaround for AstroPy bug #9218.
+                # It can be removed once the fix for that issue is widespread.
+                # See https://github.com/astropy/astropy/pull/9218
+                unit_label = re.sub(r"\^{([^}]+)}\^{([^}]+)}", r"^{\g<1>^{\g<2>}}", unit_label)
+                ylabel += " [{}]".format(unit_label)
 
         # This will need to be fixed with housekeeping. Self.label currently doesnt exist.
         if ('label' not in kwargs) and ('label' in dir(self)):
@@ -325,11 +339,12 @@ class Periodogram(object):
             # Show the legend if labels were set
             legend_labels = ax.get_legend_handles_labels()
             if (np.sum([len(a) for a in legend_labels]) != 0):
-                ax.legend()
+                ax.legend(loc='best')
             ax.set_yscale(scale)
             ax.set_xscale(scale)
             ax.set_title(title)
         return ax
+
 
     def flatten(self, method='logmedian', filter_width=0.01, return_trend=False):
         """Estimates the Signal-To-Noise (SNR) spectrum by dividing out an
@@ -381,7 +396,7 @@ class Periodogram(object):
 
         Returns
         -------
-        table : `astropy.table.Table` object
+        table : `~astropy.table.Table` object
             An AstroPy Table with columns 'frequency', 'period', and 'power'.
         """
         return Table(data=(self.frequency, self.period, self.power),
@@ -402,7 +417,7 @@ class Periodogram(object):
         return copy.deepcopy(self)
 
     def __repr__(self):
-        return('Periodogram(ID: {})'.format(self.targetid))
+        return('Periodogram(ID: {})'.format(self.label))
 
     def __getitem__(self, key):
         copy_self = self.copy()
@@ -499,7 +514,7 @@ class Periodogram(object):
                         attrs[attr]['print'] = '{}'.format(res)
                     attrs[attr]['type'] = 'str'
                 elif attr == 'wcs':
-                    attrs[attr]['print'] = 'astropy.wcs.wcs.WCS'.format(attr)
+                    attrs[attr]['print'] = 'astropy.wcs.wcs.WCS'
                     attrs[attr]['type'] = 'other'
                 else:
                     attrs[attr]['print'] = '{}'.format(type(res))
@@ -517,6 +532,17 @@ class Periodogram(object):
         print('lightkurve.Periodogram properties:')
         output.pprint(max_lines=-1, max_width=-1)
 
+    def to_seismology(self,**kwargs):
+        """Returns a `~lightkurve.seismology.Seismology` object to analyze the periodogram.
+
+        Returns
+        -------
+        seismology : `~lightkurve.seismology.Seismology`
+            Helper object to run asteroseismology methods.
+        """
+        from .seismology import Seismology
+        return Seismology(self)
+
 
 class SNRPeriodogram(Periodogram):
     """Defines a Signal-to-Noise Ratio (SNR) Periodogram class.
@@ -528,7 +554,7 @@ class SNRPeriodogram(Periodogram):
         super(SNRPeriodogram, self).__init__(*args, **kwargs)
 
     def __repr__(self):
-        return('SNRPeriodogram(ID: {})'.format(self.targetid))
+        return 'SNRPeriodogram(ID: {})'.format(self.label)
 
     def plot(self, **kwargs):
         """Plot the SNR spectrum using matplotlib's `plot` method.
@@ -541,7 +567,7 @@ class SNRPeriodogram(Periodogram):
 
         Returns
         -------
-        ax : matplotlib.axes._subplots.AxesSubplot
+        ax : `~matplotlib.axes.Axes`
             The matplotlib axes object.
         """
         ax = super(SNRPeriodogram, self).plot(**kwargs)
@@ -549,23 +575,26 @@ class SNRPeriodogram(Periodogram):
             ax.set_ylabel("Signal to Noise Ratio (SNR)")
         return ax
 
-
 class LombScarglePeriodogram(Periodogram):
     """Subclass of :class:`Periodogram <lightkurve.periodogram.Periodogram>`
     representing a power spectrum generated using the Lomb Scargle method.
     """
     def __init__(self, *args, **kwargs):
+        self._LS_object = kwargs.pop("ls_obj", None)
+        self.nterms = kwargs.pop("nterms", 1)
+        self.ls_method = kwargs.pop("ls_method", 'fastchi2')
         super(LombScarglePeriodogram, self).__init__(*args, **kwargs)
 
     def __repr__(self):
-        return('LombScarglePeriodogram(ID: {})'.format(self.targetid))
+        return('LombScarglePeriodogram(ID: {})'.format(self.label))
+
 
     @staticmethod
     def from_lightcurve(lc, minimum_frequency=None, maximum_frequency=None,
                         minimum_period=None, maximum_period=None,
                         frequency=None, period=None,
                         nterms=1, nyquist_factor=1, oversample_factor=None,
-                        freq_unit=None, normalization="amplitude",
+                        freq_unit=None, normalization="amplitude", ls_method='fast',
                         **kwargs):
         """Creates a Periodogram from a LightCurve using the Lomb-Scargle method.
 
@@ -623,8 +652,8 @@ class LombScarglePeriodogram(Periodogram):
         space beyond the Nyquist frequency, which may introduce aliasing.
 
         The `freq_unit` parameter allows a request for alternative units in frequency
-        space. By default frequency is in (1/day) and power in (amplitude
-        (ppm)). Asteroseismologists for example may want frequency in (microHz)
+        space. By default frequency is in (1/day) and power in (amplitude).
+        Asteroseismologists for example may want frequency in (microHz)
         in which case they would pass `freq_unit=u.microhertz`.
 
         By default this method uses the LombScargle 'fast' method, which assumes
@@ -653,13 +682,13 @@ class LombScarglePeriodogram(Periodogram):
             If specified, use 1./maximum_period as the minimum frequency rather
             than one over the time baseline.
         frequency :  array-like
-            The regular grid of frequencies to use. If given a unit, it is
-            converted to units of freq_unit. If not, it is assumed to be in
-            units of freq_unit. This over rides any set frequency limits.
+            The grid of frequencies to use. If given a unit, it is converted to
+            units of freq_unit. If not, it is assumed to be in units of
+            freq_unit. This over rides any set frequency limits.
         period : array-like
-            The regular grid of periods to use (as 1/period). If given a unit,
-            it is converted to units of freq_unit. If not, it is assumed to be
-            in units of 1/freq_unit. This overrides any set period limits.
+            The grid of periods to use (as 1/period). If given a unit, it is
+            converted to units of freq_unit. If not, it is assumed to be in
+            units of 1/freq_unit. This overrides any set period limits.
         nterms : int
             Default 1. Number of terms to use in the Fourier fit.
         nyquist_factor : int
@@ -683,6 +712,9 @@ class LombScarglePeriodogram(Periodogram):
             Default: `'amplitude'`. The desired normalization of the spectrum.
             Can be either power spectral density (`'psd'`) or amplitude
             (`'amplitude'`).
+        ls_method : str
+            Default: `'fast'`. Passed to the `method` keyword of
+            `astropy.stats.LombScargle()`.
         kwargs : dict
             Keyword arguments passed to `astropy.stats.LombScargle()`
 
@@ -691,20 +723,12 @@ class LombScarglePeriodogram(Periodogram):
         Periodogram : `Periodogram` object
             Returns a Periodogram object extracted from the lightcurve.
         """
-        # If the defaults are used, issue a warning to point out they changed!
-        if normalization == 'amplitude' and freq_unit is None and oversample_factor is None:
-            warnings.warn("As of Lightkurve v1.0.0 (Apr 2019), the default behavior "
-                          "of Lomb Scargle periodograms changed to use "
-                          "normalization='amplitude' and oversample_factor=5 "
-                          "(the previous defaults were normalization='psd' and "
-                          "oversample_factor=1). You can suppress this warning using "
-                          "`warnings.filterwarnings('ignore', category=lk.LightkurveWarning)`.",
-                          LightkurveWarning)
-
-        # Input validation for spectrum type
-        if normalization not in ('psd', 'amplitude'):
-            raise ValueError("The `normalization` parameter must be one of "
-                             "either 'psd' or 'amplitude'.")
+        # Input validation
+        normalization = validate_method(normalization, ['psd', 'amplitude'])
+        if np.isnan(lc.flux).any():
+            lc = lc.remove_nans()
+            log.debug('Lightcurve contains NaN values.'
+                      'These are removed before creating the periodogram.')
 
         # Setting default frequency units
         if freq_unit is None:
@@ -735,9 +759,6 @@ class LombScarglePeriodogram(Periodogram):
                           LightkurveWarning)
             maximum_frequency = kwargs.pop("max_frequency", None)
 
-        # Make sure the lightcurve object is normalized
-        lc = lc.normalize()
-
         # Check if any values of period have been passed and set format accordingly
         if not all(b is None for b in [period, minimum_period, maximum_period]):
             default_view = 'period'
@@ -750,15 +771,10 @@ class LombScarglePeriodogram(Periodogram):
             raise ValueError('You have input keyword arguments for both frequency and period. '
                              'Please only use one.')
 
-        if (~np.isfinite(lc.flux)).any():
-            raise ValueError('Lightcurve contains NaN values. Use lc.remove_nans()'
-                             ' to remove NaN values from a LightCurve.')
-
-        # Hard coding that time is in days.
-        time = lc.time.copy() * u.day
+        time = lc.time.copy()
 
         # Approximate Nyquist Frequency and frequency bin width in terms of days
-        nyquist = 0.5 * (1./(np.median(np.diff(time))))
+        nyquist = 0.5 * (1./(np.median(np.diff(time.value)))) * (1/cds.d)
         fs = (1./(time[-1] - time[0])) / oversample_factor
 
         # Convert these values to requested frequency unit
@@ -805,49 +821,77 @@ class LombScarglePeriodogram(Periodogram):
                 maximum_frequency = nyquist * nyquist_factor
 
             # Create frequency grid evenly spaced in frequency
-            frequency = np.arange(minimum_frequency.value, maximum_frequency.value, fs.to(freq_unit).value)
+            frequency = np.arange(minimum_frequency.value, maximum_frequency.value, fs.value)
 
         # Convert to desired units
         frequency = u.Quantity(frequency, freq_unit)
 
-        if nterms > 1:
-            raise NotImplementedError('Increasing the number of terms is not implemented yet.')
-        else:
-            method = 'fast'
+        # Change to compatible ls method if sampling not even in frequency
+        if not implementations.main._is_regular(frequency) and ls_method in ['fastchi2','fast']:
+            oldmethod = ls_method
+            ls_method = {'fastchi2':'chi2','fast':'slow'}[ls_method]
+            log.warning("The requested periodogram is not evenly sampled in frequency.\n"
+                        "Method has been changed from '{}' to '{}' to allow for this.".format(oldmethod,ls_method))
 
-        if period is not None:
-            method = 'slow'
-            log.warning("You have passed an evenly-spaced grid of periods. "
-                        "These are not evenly spaced in frequency space.\n"
-                        "Method has been set to 'slow' to allow for this.")
-        flux_scaling = 1e6               
+        if (nterms > 1) and (ls_method not in ['fastchi2', 'chi2']):
+            warnings.warn("Building a Lomb Scargle Periodogram using the `slow` method. "
+                            "`nterms` has been set to >1, however this is not supported under the `{}` method. "
+                            "To run with higher nterms, set `ls_method` to either 'fastchi2', or 'chi2'. "
+                            "Please refer to the `astropy.timeseries.periodogram.LombScargle` documentation.".format(ls_method),
+                          LightkurveWarning)
+            nterms = 1
+
         if float(astropy.__version__[0]) >= 3:
-            LS = LombScargle(time, lc.flux * flux_scaling,
+            LS = LombScargle(time, lc.flux,
                              nterms=nterms, normalization='psd', **kwargs)
-            power = LS.power(frequency, method=method)
+            power = LS.power(frequency, method=ls_method)
         else:
-            LS = LombScargle(time, lc.flux * flux_scaling,
+            LS = LombScargle(time, lc.flux,
                              nterms=nterms, **kwargs)
-            power = LS.power(frequency, method=method, normalization='psd')
+            power = LS.power(frequency, method=ls_method, normalization='psd')
 
-        # Power spectral density
-        if normalization == 'psd':
-            # Rescale from the unnormalized  power output by Astropy's
-            # Lomb-Scargle function to units of ppm^2 / [frequency unit]
+        if normalization == 'psd':  # Power spectral density
+            # Rescale from the unnormalized power output by Astropy's
+            # Lomb-Scargle function to units of flux_variance / [frequency unit]
             # that may be of more interest for asteroseismology.
-            power *=  2./(len(time)*oversample_factor*fs) * (cds.ppm**2)
-
-        # Amplitude spectrum
+            power *=  2. / (len(time) * oversample_factor * fs)
         elif normalization == 'amplitude':
-            factor = np.sqrt(4./len(lc.time))
-            power = np.sqrt(power) * factor
-            # Units of ppm
-            power *= cds.ppm
+            power = np.sqrt(power) * np.sqrt(4./len(lc.time))
 
         # Periodogram needs properties
         return LombScarglePeriodogram(frequency=frequency, power=power, nyquist=nyquist,
-                                      targetid=lc.targetid, label=lc.label,
-                                      default_view=default_view)
+                                      targetid=lc.meta.get('TARGETID'),
+                                      label=lc.meta.get('LABEL'),
+                                      default_view=default_view, ls_obj=LS,
+                                      nterms=nterms, ls_method=ls_method,
+                                      meta=lc.meta)
+
+    def model(self, time, frequency=None):
+        """Obtain the flux model for a given frequency and time
+
+        Parameters
+        ----------
+        time : np.ndarray
+            Time points to evaluate model.
+        frequency : frequency to evaluate model. Default is the frequency at
+                    max power.
+
+        Returns
+        -------
+        result : lightkurve.LightCurve
+            Model object with the time and flux model
+        """
+        if self._LS_object is None:
+            raise ValueError('No `astropy` Lomb Scargle object exists.')
+        if frequency is None:
+            frequency = self.frequency_at_max_power
+        f = self._LS_object.model(time, frequency)
+        lc = LightCurve(time=time,
+                        flux=f,
+                        meta={'FREQUENCY':frequency},
+                        label='LS Model',
+                        targetid='{} LS Model'.format(self.targetid))
+        return lc.normalize()
 
 
 class BoxLeastSquaresPeriodogram(Periodogram):
@@ -868,11 +912,57 @@ class BoxLeastSquaresPeriodogram(Periodogram):
         super(BoxLeastSquaresPeriodogram, self).__init__(*args, **kwargs)
 
     def __repr__(self):
-        return('BoxLeastSquaresPeriodogram(ID: {})'.format(self.targetid))
+        return('BoxLeastSquaresPeriodogram(ID: {})'.format(self.label))
 
     @staticmethod
     def from_lightcurve(lc, **kwargs):
-        """Creates a Periodogram from a LightCurve using the Box Least Squares (BLS) method."""
+        """Creates a Periodogram from a LightCurve using the Box Least Squares (BLS) method.
+
+        Parameters
+        ----------
+        lc : `LightCurve` object
+            The LightCurve from which to compute the Periodogram.
+        duration : float, array_like, or `~astropy.units.Quantity`, optional
+            The set of durations that will be considered.
+            Default to `[0.05, 0.10, 0.15, 0.20, 0.25, 0.33]` if not specified.
+        period : array_like or `~astropy.units.Quantity`, optional
+            The periods where the Periodogram should be computed.
+            If not provided, a default will be created using
+            `BoxLeastSquares.autoperiod()  <astropy.timeseries.BoxLeastSquares.autoperiod>`.
+        minimum_period, maximum_period : float or `~astropy.units.Quantity`, optional
+            If ``period`` is not provided, the minimum/maximum periods to search.
+            The defaults will be computed as described in the notes below.
+        frequency_factor : float, optional
+            If ``period`` is not provided, a factor to control the frequency spacing of periods
+            to be considered.
+        kwargs : dict
+            Keyword arguments passed to
+            `BoxLeastSquares.power() <astropy.timeseries.BoxLeastSquares.power>`
+
+        Returns
+        -------
+        Periodogram : `Periodogram` object
+            Returns a Periodogram object extracted from the lightcurve.
+
+        Notes
+        -----
+        If ``period`` is not provided, the default minimum period is computed from maximum duration and
+        the median observation time gap as
+
+        .. code-block:: python
+
+                minimum_period = max(median(diff(lc.time)) * 4,
+                                     max(duration) + median(diff(lc.time)))
+
+        The default maximum period is computed as
+
+        .. code-block:: python
+
+                maximum_period = (max(lc.time) - min(lc.time)) / 3
+
+        ensuring that any systems with at least 3 transits are within the range of searched periods.
+
+        """
         # BoxLeastSquares was added to `astropy.stats` in AstroPy v3.1 and then
         # moved to `astropy.timeseries` in v3.2, which makes the import below
         # somewhat complicated.
@@ -893,7 +983,7 @@ class BoxLeastSquaresPeriodogram(Periodogram):
             dy = None
 
         # Validate user input for `duration`
-        duration = kwargs.pop("duration", 0.25)
+        duration = kwargs.pop("duration", [0.05, 0.10, 0.15, 0.20, 0.25, 0.33])
         if duration is not None and ~np.all(np.isfinite(duration)):
             raise ValueError("`duration` parameter contains illegal nan or inf value(s)")
 
@@ -905,13 +995,13 @@ class BoxLeastSquaresPeriodogram(Periodogram):
             raise ValueError("`period` parameter contains illegal nan or inf value(s)")
         if minimum_period is None:
             if period is None:
-                minimum_period = np.max([np.median(np.diff(lc.time)) * 4,
-                                         np.max(duration) + np.median(np.diff(lc.time))])
+                minimum_period = np.max([np.median(np.diff(lc.time.value)) * 4,
+                                         np.max(duration) + np.median(np.diff(lc.time.value))])
             else:
                 minimum_period = np.min(period)
         if maximum_period is None:
             if period is None:
-                maximum_period = (np.max(lc.time) - np.min(lc.time)) / 3.
+                maximum_period = (np.max(lc.time.value) - np.min(lc.time.value)) / 3.
             else:
                 maximum_period = np.max(period)
 
@@ -922,7 +1012,7 @@ class BoxLeastSquaresPeriodogram(Periodogram):
 
         # Validate user input for `frequency_factor`
         frequency_factor = kwargs.pop("frequency_factor", 10)
-        df = frequency_factor * np.min(duration) / (np.max(lc.time) - np.min(lc.time))**2
+        df = frequency_factor * np.min(duration) / (np.max(lc.time.value) - np.min(lc.time.value))**2
         npoints = int(((1/minimum_period) - (1/maximum_period))/df)
         if npoints > 1e7:
             raise ValueError('`period` contains {} points.'
@@ -953,8 +1043,8 @@ class BoxLeastSquaresPeriodogram(Periodogram):
         return BoxLeastSquaresPeriodogram(frequency=1. / result.period,
                                           power=result.power,
                                           default_view='period',
-                                          label=lc.label,
-                                          targetid=lc.targetid,
+                                          label=lc.meta.get('LABEL'),
+                                          targetid=lc.meta.get('TARGETID'),
                                           transit_time=result.transit_time,
                                           duration=result.duration,
                                           depth=result.depth,
@@ -993,9 +1083,12 @@ class BoxLeastSquaresPeriodogram(Periodogram):
         if transit_time is None:
             transit_time = self.transit_time_at_max_power
             log.warning('No transit time specified. Using transit time at max power')
+        if not isinstance(transit_time, Time):
+            transit_time = Time(transit_time, format=self.time.format, scale=self.time.scale)
+
         return self._BLS_object.compute_stats(u.Quantity(period, 'd').value,
                                               u.Quantity(duration, 'd').value,
-                                              u.Quantity(transit_time, 'd').value)
+                                              transit_time)
 
     def get_transit_model(self, period=None, duration=None, transit_time=None):
         """Computes the transit model using the BLS, returns a lightkurve.LightCurve
@@ -1027,17 +1120,18 @@ class BoxLeastSquaresPeriodogram(Periodogram):
         if transit_time is None:
             transit_time = self.transit_time_at_max_power
             log.warning('No transit time specified. Using transit time at max power')
+        if not isinstance(transit_time, Time):
+            transit_time = Time(transit_time, format=self.time.format, scale=self.time.scale)
 
         model_flux = self._BLS_object.model(self.time, u.Quantity(period, 'd').value,
                                             u.Quantity(duration, 'd').value,
-                                            u.Quantity(transit_time, 'd').value)
-        model = LightCurve(self.time, model_flux, label='Transit Model Flux')
+                                            transit_time)
+        model = LightCurve(time=self.time, flux=model_flux, label='Transit Model Flux')
         return model
 
     def get_transit_mask(self, period=None, duration=None, transit_time=None):
-        """Computes the transit mask using the BLS, returns a lightkurve.LightCurve
-
-        True where there are no transits.
+        """Returns a boolean array that is ``True`` during transits and
+        ``False`` elsewhere.
 
         Parameters
         ----------
@@ -1050,11 +1144,11 @@ class BoxLeastSquaresPeriodogram(Periodogram):
 
         Returns
         -------
-        mask : np.array of Bool
-            Mask that removes transits. Mask is True where there are no transits.
+        transit_mask : np.array of bool
+            Mask that flags transits. Mask is ``True`` where there are transits.
         """
         model = self.get_transit_model(period=period, duration=duration, transit_time=transit_time)
-        return model.flux == np.median(model.flux)
+        return model.flux != np.median(model.flux)
 
     @property
     def transit_time_at_max_power(self):
@@ -1082,7 +1176,7 @@ class BoxLeastSquaresPeriodogram(Periodogram):
 
         Returns
         -------
-        ax : matplotlib.axes._subplots.AxesSubplot
+        ax : `~matplotlib.axes.Axes`
             The matplotlib axes object.
         """
         ax = super(BoxLeastSquaresPeriodogram, self).plot(**kwargs)

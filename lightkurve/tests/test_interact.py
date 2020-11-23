@@ -1,16 +1,20 @@
 """Tests the features of the lightkurve.interact module."""
-from astropy.utils.data import get_pkg_data_filename
-import pytest
 import warnings
-import sys
+
+from astropy.utils.data import get_pkg_data_filename
+import numpy as np
+import pytest
 
 from .. import LightkurveWarning
 from ..targetpixelfile import KeplerTargetPixelFile, TessTargetPixelFile
 from .test_targetpixelfile import TABBY_TPF
+from ..interact import get_lightcurve_y_limits
+
 
 bad_optional_imports = False
 try:
     import bokeh
+    from bokeh.plotting import ColumnDataSource
 except ImportError:
     bad_optional_imports = True
 
@@ -90,18 +94,18 @@ def test_custom_exported_filename():
 
 
 @pytest.mark.skipif(bad_optional_imports, reason="requires bokeh")
-def test_max_cadences():
-    """Can we provide a custom lightcurve to show?"""
-    import bokeh
+def test_transform_and_ylim_funcs():
+    """Test the transform_func and ylim_func"""
     with warnings.catch_warnings():
         # Ignore the "TELESCOP is not equal to TESS" warning
         warnings.simplefilter("ignore", LightkurveWarning)
         tpfs = [KeplerTargetPixelFile(TABBY_TPF),
                 TessTargetPixelFile(example_tpf)]
     for tpf in tpfs:
-        with pytest.raises(RuntimeError) as exc:
-            tpf.interact(max_cadences=2)
-            assert('Interact cannot display more than' in exc.value.args[0])
+        tpf.interact(transform_func=lambda lc:lc.normalize())
+        tpf.interact(transform_func=lambda lc:lc.flatten().normalize())
+        tpf.interact(transform_func=lambda lc:lc, ylim_func=lambda lc: (0, 2))
+        tpf.interact(ylim_func=lambda lc: (0, lc.flux.max()))
 
 
 @pytest.mark.skipif(bad_optional_imports, reason="requires bokeh")
@@ -118,6 +122,15 @@ def test_interact_functions():
     lc_source = prepare_lightcurve_datasource(lc)
     get_lightcurve_y_limits(lc_source)
     make_lightcurve_figure_elements(lc, lc_source)
+
+    def ylim_func_sample(lc):
+        return (np.nanpercentile(lc.flux, 0.1), np.nanpercentile(lc.flux, 99.9))
+    make_lightcurve_figure_elements(lc, lc_source, ylim_func=ylim_func_sample)
+
+    def ylim_func_unitless(lc):
+        return (np.nanpercentile(lc.flux, 0.1).value, np.nanpercentile(lc.flux, 99.9).value)
+    make_lightcurve_figure_elements(lc, lc_source, ylim_func=ylim_func_unitless)
+
     make_tpf_figure_elements(tpf, tpf_source)
     show_interact_widget(tpf)
 
@@ -134,3 +147,13 @@ def test_interact_sky_functions():
     fig1, slider1 = make_tpf_figure_elements(tpf, tpf_source)
     add_gaia_figure_elements(tpf, fig1)
     add_gaia_figure_elements(tpf, fig1, magnitude_limit=22)
+
+
+@pytest.mark.skipif(bad_optional_imports, reason="requires bokeh")
+def test_ylim_with_nans():
+    """Regression test for #679: y limits should not be NaN."""
+    lc_source = ColumnDataSource({'flux': [-1, np.nan, 1]})
+    ymin, ymax = get_lightcurve_y_limits(lc_source)
+    # ymin/ymax used to return nan, make sure this is no longer the case
+    assert ymin == -1.176
+    assert ymax == 1.176

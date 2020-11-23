@@ -37,6 +37,7 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
+junit/
 htmlcov/
 .tox/
 .coverage
@@ -60,6 +61,9 @@ docs/source/api/*
 # PyBuilder
 target/
 
+# PyCharm
+.idea
+
 # Custom additions
 pyraf
 
@@ -70,7 +74,12 @@ pyraf
 .*.swp
 .*.swo
 
+# Visual Studio Code
+.vscode
+*.code-workspace
+
 sandbox
 mastDownload
 .pytest_cache
-.vscode
+.python-version
+poetry.lock

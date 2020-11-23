@@ -14,14 +14,17 @@ visualization widget showing the pixel data and a lightcurve::
 Note that this will only work inside a Jupyter notebook at this time.
 """
 from __future__ import division, print_function
+import os
 import logging
 import warnings
+
 import numpy as np
-from astropy.stats import sigma_clip
-from .utils import KeplerQualityFlags, LightkurveWarning
-import os
-from astropy.coordinates import SkyCoord, Angle
 import astropy.units as u
+from astropy.coordinates import SkyCoord, Angle
+from astropy.stats import sigma_clip
+from astropy.utils.exceptions import AstropyUserWarning
+
+from .utils import KeplerQualityFlags, LightkurveWarning
 
 log = logging.getLogger(__name__)
 
@@ -30,17 +33,20 @@ try:
     import bokeh  # Import bokeh first so we get an ImportError we can catch
     from bokeh.io import show, output_notebook, push_notebook
     from bokeh.plotting import figure, ColumnDataSource
-    from bokeh.models import LogColorMapper, Selection, Slider, RangeSlider, \
-        Span, ColorBar, LogTicker, Range1d
+    from bokeh.models import LogColorMapper, Slider, RangeSlider, \
+        Span, ColorBar, LogTicker, Range1d, LinearColorMapper, BasicTicker
     from bokeh.layouts import layout, Spacer
     from bokeh.models.tools import HoverTool
     from bokeh.models.widgets import Button, Div
     from bokeh.models.formatters import PrintfTickFormatter
-    import ipywidgets as widgets
 except ImportError:
     # We will print a nice error message in the `show_interact_widget` function
     pass
 
+
+def _to_unitless(items):
+    """Convert the values in the item list to unitless one"""
+    return [getattr(item, 'value', item) for item in items]
 
 def prepare_lightcurve_datasource(lc):
     """Prepare a bokeh ColumnDataSource object for tool tips.
@@ -57,13 +63,15 @@ def prepare_lightcurve_datasource(lc):
     # Convert time into human readable strings, breaks with NaN time
     # See https://github.com/KeplerGO/lightkurve/issues/116
     if (lc.time == lc.time).all():
-        human_time = lc.astropy_time.isot
+        human_time = lc.time.isot
     else:
         human_time = [' '] * len(lc.flux)
 
     # Convert binary quality numbers into human readable strings
     qual_strings = []
     for bitmask in lc.quality:
+        if isinstance(bitmask, u.Quantity):
+            bitmask = bitmask.value
         flag_str_list = KeplerQualityFlags.decode(bitmask)
         if len(flag_str_list) == 0:
             qual_strings.append(' ')
@@ -73,11 +81,11 @@ def prepare_lightcurve_datasource(lc):
             qual_strings.append("; ".join(flag_str_list))
 
     lc_source = ColumnDataSource(data=dict(
-                                 time=lc.time,
+                                 time=lc.time.value,
                                  time_iso=human_time,
-                                 flux=lc.flux,
-                                 cadence=lc.cadenceno,
-                                 quality_code=lc.quality,
+                                 flux=lc.flux.value,
+                                 cadence=lc.cadenceno.value,
+                                 quality_code=lc.quality.value,
                                  quality=np.array(qual_strings)))
     return lc_source
 
@@ -102,10 +110,8 @@ def prepare_tpf_datasource(tpf, aperture_mask):
     xx = tpf.column + np.arange(tpf.shape[2])
     yy = tpf.row + np.arange(tpf.shape[1])
     xa, ya = np.meshgrid(xx, yy)
-    preselected = Selection()
-    preselected.indices = pixel_index_array[aperture_mask].reshape(-1).tolist()
-    tpf_source = ColumnDataSource(data=dict(xx=xa+0.5, yy=ya+0.5),
-                                  selected=preselected)
+    tpf_source = ColumnDataSource(data=dict(xx=xa.astype(float), yy=ya.astype(float)))
+    tpf_source.selected.indices = pixel_index_array[aperture_mask].reshape(-1).tolist()
     return tpf_source
 
 
@@ -122,13 +128,15 @@ def get_lightcurve_y_limits(lc_source):
     ymin, ymax : float, float
         Flux min and max limits.
     """
-    flux = sigma_clip(lc_source.data['flux'], sigma=5)
+    with warnings.catch_warnings():  # Ignore warnings due to NaNs
+        warnings.simplefilter("ignore", AstropyUserWarning)
+        flux = sigma_clip(lc_source.data['flux'], sigma=5, masked=False)
     low, high = np.nanpercentile(flux, (1, 99))
     margin = 0.10 * (high - low)
     return low - margin, high + margin
 
 
-def make_lightcurve_figure_elements(lc, lc_source):
+def make_lightcurve_figure_elements(lc, lc_source, ylim_func=None):
     """Make the lightcurve figure elements.
 
     Parameters
@@ -144,13 +152,14 @@ def make_lightcurve_figure_elements(lc, lc_source):
     step_renderer : GlyphRenderer
     vertical_line : Span
     """
-    if lc.mission == 'K2':
+    mission = lc.meta.get('MISSION')
+    if mission == 'K2':
         title = "Lightcurve for {} (K2 C{})".format(
             lc.label, lc.campaign)
-    elif lc.mission == 'Kepler':
+    elif mission == 'Kepler':
         title = "Lightcurve for {} (Kepler Q{})".format(
             lc.label, lc.quarter)
-    elif lc.mission == 'TESS':
+    elif mission == 'TESS':
         title = "Lightcurve for {} (TESS Sec. {})".format(
             lc.label, lc.sector)
     else:
@@ -170,9 +179,12 @@ def make_lightcurve_figure_elements(lc, lc_source):
             fig.xaxis.axis_label = 'Time - 2457000 (days)'
     except AttributeError:  # no mission keyword available
       pass
-        
 
-    ylims = get_lightcurve_y_limits(lc_source)
+
+    if ylim_func is None:
+        ylims = get_lightcurve_y_limits(lc_source)
+    else:
+        ylims = _to_unitless(ylim_func(lc))
     fig.y_range = Range1d(start=ylims[0], end=ylims[1])
 
     # Add step lines, circles, and hover-over tooltips
@@ -188,7 +200,7 @@ def make_lightcurve_figure_elements(lc, lc_source):
                       fill_color=None, hover_fill_color="firebrick",
                       hover_alpha=0.9, hover_line_color="white")
     tooltips = [("Cadence", "@cadence"),
-                ("Time ({})".format(lc.time_format.upper()),
+                ("Time ({})".format(lc.time.format.upper()),
                  "@time{0,0.000}"),
                 ("Time (ISO)", "@time_iso"),
                 ("Flux", "@flux"),
@@ -198,7 +210,7 @@ def make_lightcurve_figure_elements(lc, lc_source):
                             mode='mouse', point_policy="snap_to_data"))
 
     # Vertical line to indicate the cadence
-    vertical_line = Span(location=lc.time[0], dimension='height',
+    vertical_line = Span(location=lc.time[0].value, dimension='height',
                          line_color='firebrick', line_width=4, line_alpha=0.5)
     fig.add_layout(vertical_line)
 
@@ -229,25 +241,31 @@ def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
     result = result[result.Gmag < magnitude_limit]
     if len(result) == 0:
         raise no_targets_found_message
-    radecs = np.vstack([result['RA_ICRS'], result['DE_ICRS']]).T
-    coords = tpf.wcs.all_world2pix(radecs, 1) ## TODO, is origin supposed to be zero or one?
-    year = ((tpf.astropy_time[0].jd - 2457206.375) * u.day).to(u.year)
-    pmra = ((np.nan_to_num(np.asarray(result.pmRA)) * u.milliarcsecond/u.year) * year).to(u.arcsec).value
-    pmdec = ((np.nan_to_num(np.asarray(result.pmDE)) * u.milliarcsecond/u.year) * year).to(u.arcsec).value
+
+    # Apply correction for proper motion
+    year = ((tpf.time[0].jd - 2457206.375) * u.day).to(u.year)
+    pmra = ((np.nan_to_num(np.asarray(result.pmRA)) * u.milliarcsecond/u.year) * year).to(u.deg).value
+    pmdec = ((np.nan_to_num(np.asarray(result.pmDE)) * u.milliarcsecond/u.year) * year).to(u.deg).value
     result.RA_ICRS += pmra
     result.DE_ICRS += pmdec
+
+    # Convert to pixel coordinates
+    radecs = np.vstack([result['RA_ICRS'], result['DE_ICRS']]).T
+    coords = tpf.wcs.all_world2pix(radecs, 0)
 
     # Gently size the points by their Gaia magnitude
     sizes = 64.0 / 2**(result['Gmag']/5.0)
     one_over_parallax = 1.0 / (result['Plx']/1000.)
     source = ColumnDataSource(data=dict(ra=result['RA_ICRS'],
                                         dec=result['DE_ICRS'],
+                                        pmra=result['pmRA'],
+                                        pmde=result['pmDE'],
                                         source=result['Source'].astype(str),
                                         Gmag=result['Gmag'],
                                         plx=result['Plx'],
                                         one_over_plx=one_over_parallax,
-                                        x=coords[:, 0]+tpf.column,
-                                        y=coords[:, 1]+tpf.row,
+                                        x=coords[:, 0] + tpf.column,
+                                        y=coords[:, 1] + tpf.row,
                                         size=sizes))
 
     r = fig.circle('x', 'y', source=source, fill_alpha=0.3, size='size',
@@ -262,6 +280,8 @@ def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
                                       ("Parallax (mas)", "@plx (~@one_over_plx{0,0} pc)"),
                                       ("RA", "@ra{0,0.00000000}"),
                                       ("DEC", "@dec{0,0.00000000}"),
+                                      ("pmRA", "@pmra{0,0.000} mas/yr"),
+                                      ("pmDE", "@pmde{0,0.000} mas/yr"),
                                       ("x", "@x"),
                                       ("y", "@y")],
                             renderers=[r],
@@ -270,8 +290,9 @@ def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
     return fig, r
 
 
-def make_tpf_figure_elements(tpf, tpf_source, pedestal=0, fiducial_frame=None,
-                             plot_width=370, plot_height=340):
+def make_tpf_figure_elements(tpf, tpf_source, pedestal=None, fiducial_frame=None,
+                             plot_width=370, plot_height=340, scale='log', vmin=None, vmax=None,
+                             cmap='Viridis256', tools='tap,box_select,wheel_zoom,reset'):
     """Returns the lightcurve figure elements.
 
     Parameters
@@ -280,18 +301,32 @@ def make_tpf_figure_elements(tpf, tpf_source, pedestal=0, fiducial_frame=None,
         TPF to show.
     tpf_source : bokeh.plotting.ColumnDataSource
         TPF data source.
+    pedestal: float
+        A scalar value to be added to the TPF flux values, often to avoid
+        taking the log of a negative number in colorbars.
+        Defaults to `-min(tpf.flux) + 1`
     fiducial_frame: int
         The tpf slice to start with by default, it is assumed the WCS
         is exact for this frame.
-    pedestal: float
-        A scalar value to be added to the TPF flux values, often to avoid
-        taking the log of a negative number in colorbars
-
-
+    scale: str
+        Color scale for tpf figure. Default is 'log'
+    vmin: int [optional]
+        Minimum color scale for tpf figure
+    vmax: int [optional]
+        Maximum color scale for tpf figure
+    cmap: str
+        Colormap to use for tpf plot. Default is 'Viridis256'
+    tools: str
+        Bokeh tool list
     Returns
     -------
     fig, stretch_slider : bokeh.plotting.figure.Figure, RangeSlider
     """
+    if pedestal is None:
+        pedestal = -np.nanmin(tpf.flux.value) + 1
+    if scale == 'linear':
+        pedestal = 0
+
     if tpf.mission in ['Kepler', 'K2']:
         title = 'Pixel data (CCD {}.{})'.format(tpf.module, tpf.output)
     elif tpf.mission == 'TESS':
@@ -299,21 +334,39 @@ def make_tpf_figure_elements(tpf, tpf_source, pedestal=0, fiducial_frame=None,
     else:
         title = "Pixel data"
 
+    # We subtract 0.5 from the range below because pixel coordinates refer to
+    # the middle of a pixel, e.g. (col, row) = (10.0, 20.0) is a pixel center.
     fig = figure(plot_width=plot_width, plot_height=plot_height,
-                 x_range=(tpf.column, tpf.column+tpf.shape[2]),
-                 y_range=(tpf.row, tpf.row+tpf.shape[1]),
-                 title=title, tools='tap,box_select,wheel_zoom,reset',
+                 x_range=(tpf.column-0.5, tpf.column+tpf.shape[2]-0.5),
+                 y_range=(tpf.row-0.5, tpf.row+tpf.shape[1]-0.5),
+                 title=title, tools=tools,
                  toolbar_location="below",
                  border_fill_color="whitesmoke")
 
     fig.yaxis.axis_label = 'Pixel Row Number'
     fig.xaxis.axis_label = 'Pixel Column Number'
 
-    vlo, lo, hi, vhi = np.nanpercentile(tpf.flux - pedestal, [0.2, 1, 95, 99.8])
-    vstep = (np.log10(vhi) - np.log10(vlo)) / 300.0  # assumes counts >> 1.0!
-    color_mapper = LogColorMapper(palette="Viridis256", low=lo, high=hi)
 
-    fig.image([tpf.flux[fiducial_frame, :, :] - pedestal], x=tpf.column, y=tpf.row,
+    vlo, lo, hi, vhi = np.nanpercentile(tpf.flux.value + pedestal, [0.2, 1, 95, 99.8])
+    if vmin is not None:
+        vlo, lo = vmin, vmin
+    if vmax is not None:
+        vhi, hi = vmax, vmax
+
+    if scale == 'log':
+        vstep = (np.log10(vhi) - np.log10(vlo)) / 300.0  # assumes counts >> 1.0!
+    if scale == 'linear':
+        vstep = (vhi - vlo) / 300.0  # assumes counts >> 1.0!
+
+    if scale == 'log':
+        color_mapper = LogColorMapper(palette=cmap, low=lo, high=hi)
+    elif scale == 'linear':
+        color_mapper = LinearColorMapper(palette=cmap, low=lo, high=hi)
+    else:
+        raise ValueError('Please specify either `linear` or `log` scale for color.')
+
+    fig.image([tpf.flux.value[fiducial_frame, :, :] + pedestal],
+              x=tpf.column-0.5, y=tpf.row-0.5,
               dw=tpf.shape[2], dh=tpf.shape[1], dilate=True,
               color_mapper=color_mapper, name="tpfimg")
 
@@ -322,8 +375,14 @@ def make_tpf_figure_elements(tpf, tpf_source, pedestal=0, fiducial_frame=None,
     # This colorbar share of the plot window grows, shrinking plot area.
     # This effect is known, some workarounds might work to fix the plot area:
     # https://github.com/bokeh/bokeh/issues/5186
+
+    if scale == 'log':
+        ticker = LogTicker(desired_num_ticks=8)
+    elif scale == 'linear':
+        ticker = BasicTicker(desired_num_ticks=8)
+
     color_bar = ColorBar(color_mapper=color_mapper,
-                         ticker=LogTicker(desired_num_ticks=8),
+                         ticker=ticker,
                          label_standoff=-10, border_line_color=None,
                          location=(0, 0), background_fill_color='whitesmoke',
                          major_label_text_align='left',
@@ -331,37 +390,53 @@ def make_tpf_figure_elements(tpf, tpf_source, pedestal=0, fiducial_frame=None,
                          title='e/s', margin=0)
     fig.add_layout(color_bar, 'right')
 
-    color_bar.formatter = PrintfTickFormatter(format="%14u")
+    color_bar.formatter = PrintfTickFormatter(format="%14i")
 
     if tpf_source is not None:
         fig.rect('xx', 'yy', 1, 1, source=tpf_source, fill_color='gray',
                 fill_alpha=0.4, line_color='white')
 
     # Configure the stretch slider and its callback function
-    stretch_slider = RangeSlider(start=np.log10(vlo),
-                                 end=np.log10(vhi),
+    if scale == 'log':
+        start, end = np.log10(vlo), np.log10(vhi)
+        values = (np.log10(lo), np.log10(hi))
+    elif scale == 'linear':
+        start, end = vlo, vhi
+        values = (lo, hi)
+
+    stretch_slider = RangeSlider(start=start,
+                                 end=end,
                                  step=vstep,
-                                 title='Screen Stretch (log)',
-                                 value=(np.log10(lo), np.log10(hi)),
+                                 title='Screen Stretch ({})'.format(scale),
+                                 value=values,
                                  orientation='horizontal',
                                  width=200,
                                  direction='ltr',
                                  show_value=True,
                                  sizing_mode='fixed',
+                                 height=15,
                                  name='tpfstretch')
 
-    def stretch_change_callback(attr, old, new):
+    def stretch_change_callback_log(attr, old, new):
         """TPF stretch slider callback."""
         fig.select('tpfimg')[0].glyph.color_mapper.high = 10**new[1]
         fig.select('tpfimg')[0].glyph.color_mapper.low = 10**new[0]
 
-    stretch_slider.on_change('value', stretch_change_callback)
+    def stretch_change_callback_linear(attr, old, new):
+        """TPF stretch slider callback."""
+        fig.select('tpfimg')[0].glyph.color_mapper.high = new[1]
+        fig.select('tpfimg')[0].glyph.color_mapper.low = new[0]
+
+    if scale == 'log':
+        stretch_slider.on_change('value', stretch_change_callback_log)
+    if scale == 'linear':
+        stretch_slider.on_change('value', stretch_change_callback_linear)
 
     return fig, stretch_slider
 
 
 def make_default_export_name(tpf, suffix='custom-lc'):
-    """makes the default name to save a custom intetract mask"""
+    """makes the default name to save a custom interact mask"""
     fn = tpf.hdu.filename()
     if fn is None:
         outname = "{}_{}_{}.fits".format(tpf.mission, tpf.targetid, suffix)
@@ -372,9 +447,16 @@ def make_default_export_name(tpf, suffix='custom-lc'):
 
 
 def show_interact_widget(tpf, notebook_url='localhost:8888',
-                         max_cadences=30000,
-                         aperture_mask='pipeline',
-                         exported_filename=None):
+                         lc=None,
+                         max_cadences=200000,
+                         aperture_mask='default',
+                         exported_filename=None,
+                         transform_func=None,
+                         ylim_func=None,
+                         vmin=None,
+                         vmax=None,
+                         scale='log',
+                         cmap='Viridis256'):
     """Display an interactive Jupyter Notebook widget to inspect the pixel data.
 
     The widget will show both the lightcurve and pixel data.  The pixel data
@@ -398,9 +480,43 @@ def show_interact_widget(tpf, notebook_url='localhost:8888',
         will need to supply this value for the application to display
         properly. If no protocol is supplied in the URL, e.g. if it is
         of the form "localhost:8888", then "http" will be used.
-    max_cadences : int
+    max_cadences: int
         Raise a RuntimeError if the number of cadences shown is larger than
         this value. This limit helps keep browsers from becoming unresponsive.
+    aperture_mask : array-like, 'pipeline', 'threshold', 'default', or 'all'
+        A boolean array describing the aperture such that `True` means
+        that the pixel will be used.
+        If None or 'all' are passed, all pixels will be used.
+        If 'pipeline' is passed, the mask suggested by the official pipeline
+        will be returned.
+        If 'threshold' is passed, all pixels brighter than 3-sigma above
+        the median flux will be used.
+        If 'default' is passed, 'pipeline' mask will be used when available,
+        with 'threshold' as the fallback.
+    exported_filename: str
+        An optional filename to assign to exported fits files containing
+        the custom aperture mask generated by clicking on pixels in interact.
+        The default adds a suffix '-custom-aperture-mask.fits' to the
+        TargetPixelFile basename.
+    transform_func: function
+        A function that transforms the lightcurve.  The function takes in a
+        LightCurve object as input and returns a LightCurve object as output.
+        The function can be complex, such as detrending the lightcurve.  In this
+        way, the interactive selection of aperture mask can be evaluated after
+        inspection of the transformed lightcurve.  The transform_func is applied
+        before saving a fits file.  Default: None (no transform is applied).
+    ylim_func: function
+        A function that returns ylimits (low, high) given a LightCurve object.
+        The default is to return an expanded window around the 10-90th
+        percentile of lightcurve flux values.
+    scale: str
+        Color scale for tpf figure. Default is 'log'
+    vmin: int [optional]
+        Minimum color scale for tpf figure
+    vmax: int [optional]
+        Maximum color scale for tpf figure
+    cmap: str
+        Colormap to use for tpf plot. Default is 'Viridis256'
     """
     try:
         import bokeh
@@ -412,6 +528,13 @@ def show_interact_widget(tpf, notebook_url='localhost:8888',
         return None
 
     aperture_mask = tpf._parse_aperture_mask(aperture_mask)
+    if ~aperture_mask.any():
+        log.error("No pixels in `aperture_mask`, finding optimum aperture using `tpf.create_threshold_mask`.")
+        aperture_mask = tpf.create_threshold_mask()
+    if ~aperture_mask.any():
+        log.error("No pixels in `aperture_mask`, using all pixels.")
+        aperture_mask = tpf._parse_aperture_mask('all')
+
 
     if exported_filename is None:
         exported_filename = make_default_export_name(tpf)
@@ -423,16 +546,37 @@ def show_interact_widget(tpf, notebook_url='localhost:8888',
     if ('.fits' not in exported_filename.lower()):
         exported_filename += '.fits'
 
-    lc = tpf.to_lightcurve(aperture_mask=aperture_mask)
+    if lc is None:
+        lc = tpf.to_lightcurve(aperture_mask=aperture_mask)
+        tools = 'tap,box_select,wheel_zoom,reset'
+    else:
+        lc = lc.copy()
+        tools = 'wheel_zoom,reset'
+        aperture_mask = np.zeros(tpf.flux.shape[1:]).astype(bool)
+        aperture_mask[0, 0] = True
+
+    lc.meta['APERTURE_MASK'] = aperture_mask
+
+    if transform_func is not None:
+        lc = transform_func(lc)
 
     npix = tpf.flux[0, :, :].size
     pixel_index_array = np.arange(0, npix, 1).reshape(tpf.flux[0].shape)
 
     # Bokeh cannot handle many data points
     # https://github.com/bokeh/bokeh/issues/7490
-    if len(lc.cadenceno) > max_cadences:
-        msg = 'Interact cannot display more than {} cadences.'
-        raise RuntimeError(msg.format(max_cadences))
+    n_cadences = len(lc.cadenceno)
+    if n_cadences > max_cadences:
+        log.error(f"Error: interact cannot display more than {max_cadences} "
+                  "cadences without suffering significant performance issues. "
+                  "You can limit the number of cadences show using slicing, e.g. "
+                  "`tpf[0:1000].interact()`. Alternatively, you can override "
+                  "this limitation by passing the `max_cadences` argument.")
+    elif n_cadences > 30000:
+        log.warning(f"Warning: the pixel file contains {n_cadences} cadences. "
+                    "The performance of interact() is very slow for such a "
+                    "large number of frames. Consider using slicing, e.g. "
+                    "`tpf[0:1000].interact()`, to make interact run faster.")
 
     def create_interact_ui(doc):
         # The data source includes metadata for hover-over tooltips
@@ -440,13 +584,19 @@ def show_interact_widget(tpf, notebook_url='localhost:8888',
         tpf_source = prepare_tpf_datasource(tpf, aperture_mask)
 
         # Create the lightcurve figure and its vertical marker
-        fig_lc, vertical_line = make_lightcurve_figure_elements(lc, lc_source)
+        fig_lc, vertical_line = make_lightcurve_figure_elements(lc, lc_source,
+                                                            ylim_func=ylim_func)
 
         # Create the TPF figure and its stretch slider
-        pedestal = np.nanmin(tpf.flux)
+        pedestal = -np.nanmin(tpf.flux.value) + 1
+        if scale == 'linear':
+            pedestal = 0
         fig_tpf, stretch_slider = make_tpf_figure_elements(tpf, tpf_source,
                                                            pedestal=pedestal,
-                                                           fiducial_frame=0)
+                                                           fiducial_frame=0,
+                                                           vmin=vmin, vmax=vmax,
+                                                           scale=scale, cmap=cmap,
+                                                           tools=tools)
 
         # Helper lookup table which maps cadence number onto flux array index.
         tpf_index_lookup = {cad: idx for idx, cad in enumerate(tpf.cadenceno)}
@@ -465,6 +615,24 @@ def show_interact_widget(tpf, notebook_url='localhost:8888',
         message_on_save = Div(text=' ',width=600, height=15)
 
         # Callbacks
+        def _create_lightcurve_from_pixels(tpf, selected_pixel_indices,
+                                            transform_func=transform_func):
+            """Create the lightcurve from the selected pixel index list"""
+            selected_indices = np.array(selected_pixel_indices)
+            selected_mask = np.isin(pixel_index_array, selected_indices)
+            lc_new = tpf.to_lightcurve(aperture_mask=selected_mask)
+            lc_new.meta['APERTURE_MASK'] = selected_mask
+            if transform_func is not None:
+                lc_transformed = transform_func(lc_new)
+                if (len(lc_transformed) != len(lc_new)):
+                    warnings.warn('Dropping cadences in `transform_func` is not '
+                                  'yet supported due to fixed time coordinates.'
+                            'Skipping the transformation...', LightkurveWarning)
+                else:
+                    lc_new = lc_transformed
+                    lc_new.meta['APERTURE_MASK'] = selected_mask
+            return lc_new
+
         def update_upon_pixel_selection(attr, old, new):
             """Callback to take action when pixels are selected."""
             # Check if a selection was "re-clicked", then de-select
@@ -473,15 +641,17 @@ def show_interact_widget(tpf, notebook_url='localhost:8888',
                 tpf_source.selected.indices = new[1:]
 
             if new != []:
-                selected_indices = np.array(new)
-                selected_mask = np.isin(pixel_index_array, selected_indices)
-                lc_new = tpf.to_lightcurve(aperture_mask=selected_mask)
-                lc_source.data['flux'] = lc_new.flux
-                ylims = get_lightcurve_y_limits(lc_source)
+                lc_new = _create_lightcurve_from_pixels(tpf, new, transform_func=transform_func)
+                lc_source.data['flux'] = lc_new.flux.value
+
+                if ylim_func is None:
+                    ylims = get_lightcurve_y_limits(lc_source)
+                else:
+                    ylims = ylim_func(lc_new)
                 fig_lc.y_range.start = ylims[0]
                 fig_lc.y_range.end = ylims[1]
             else:
-                lc_source.data['flux'] = lc.flux * 0.0
+                lc_source.data['flux'] = lc.flux.value * 0.0
                 fig_lc.y_range.start = -1
                 fig_lc.y_range.end = 1
 
@@ -493,11 +663,11 @@ def show_interact_widget(tpf, notebook_url='localhost:8888',
             if new in tpf.cadenceno:
                 frameno = tpf_index_lookup[new]
                 fig_tpf.select('tpfimg')[0].data_source.data['image'] = \
-                    [tpf.flux[frameno, :, :] - pedestal]
-                vertical_line.update(location=tpf.time[frameno])
+                    [tpf.flux.value[frameno, :, :] + pedestal]
+                vertical_line.update(location=tpf.time.value[frameno])
             else:
                 fig_tpf.select('tpfimg')[0].data_source.data['image'] = \
-                    [tpf.flux[0, :, :] * np.NaN]
+                    [tpf.flux.value[0, :, :] * np.NaN]
             lc_source.selected.indices = []
 
         def go_right_by_one():
@@ -515,14 +685,14 @@ def show_interact_widget(tpf, notebook_url='localhost:8888',
         def save_lightcurve():
             """Save the lightcurve as a fits file with mask as HDU extension"""
             if tpf_source.selected.indices != []:
-                selected_indices = np.array(tpf_source.selected.indices)
-                selected_mask = np.isin(pixel_index_array, selected_indices)
-                lc_new = tpf.to_lightcurve(aperture_mask=selected_mask)
+                lc_new = _create_lightcurve_from_pixels(tpf, tpf_source.selected.indices,
+                                                    transform_func=transform_func)
                 lc_new.to_fits(exported_filename, overwrite=True,
-                               aperture_mask=selected_mask.astype(np.int),
+                               flux_column_name='SAP_FLUX',
+                               aperture_mask=lc_new.meta['APERTURE_MASK'].astype(np.int),
                                SOURCE='lightkurve interact',
                                NOTE='custom mask',
-                               MASKNPIX=np.nansum(selected_mask))
+                               MASKNPIX=np.nansum(lc_new.meta['APERTURE_MASK']))
                 if message_on_save.text == " ":
                     text = '<font color="black"><i>Saved file {} </i></font>'
                     message_on_save.text = text.format(exported_filename)
@@ -603,9 +773,7 @@ def show_skyview_widget(tpf, notebook_url='localhost:8888', magnitude_limit=18):
         tpf_source = None
 
         # Create the TPF figure and its stretch slider
-        pedestal = np.nanmin(tpf.flux)
         fig_tpf, stretch_slider = make_tpf_figure_elements(tpf, tpf_source,
-                                                pedestal=pedestal,
                                                 fiducial_frame=fiducial_frame,
                                                 plot_width=640, plot_height=600)
         fig_tpf, r = add_gaia_figure_elements(tpf, fig_tpf,
