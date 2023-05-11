@@ -2349,7 +2349,7 @@ class KeplerTargetPixelFile(TargetPixelFile):
         kep_prfs = []
         prf_models = []
 
-        for idx in tqdm(range(self.shape[0])):
+        for idx in tqdm(range(self.shape[0])): # for each cadence
             try:
                 keplerprf = KeplerPRF(self.channel, self.shape[1:], new_coords[0][idx], new_coords[1][idx])
             except ValueError:
@@ -2362,7 +2362,7 @@ class KeplerTargetPixelFile(TargetPixelFile):
             
         # Dot the PRF with the timeseries add it to the data
         new_tpfs = []
-        for idx in tqdm(range(len(X))):
+        for idx in tqdm(range(len(X))): # for each cadence
             new_tpf = np.array(copy.copy(self).flux[idx]) + X[idx].dot(timeseries[idx])
             new_tpfs.append(new_tpf)
 
