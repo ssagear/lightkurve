@@ -2336,6 +2336,40 @@ class KeplerTargetPixelFile(TargetPixelFile):
         }
         return KeplerLightCurve(time=self.time, flux=lc.flux, **keys)
 
+    def inject(self, coords, timeseries):
+        """Work in progress
+        Demo in injection_explore/prf_explore.ipynb
+        """
+
+        import copy
+
+        pixel_ra, pixel_dec = self.wcs.world_to_pixel(coords)# + (self.pos_corr1, self.pos_corr2)
+        new_coords = (pixel_ra + self.pos_corr1, pixel_dec + self.pos_corr2)
+
+        kep_prfs = []
+        prf_models = []
+
+        for idx in tqdm(range(self.shape[0])):
+            try:
+                keplerprf = KeplerPRF(self.channel, self.shape[1:], new_coords[0][idx], new_coords[1][idx])
+            except ValueError:
+                print(self.channel, self.shape[1:], new_coords[0][idx], new_coords[1][idx])
+            kep_prfs.append(keplerprf)
+            prf_models.append(keplerprf(flux=1.0, center_col=10, center_row=10, scale_row=0.7, scale_col=0.7, 
+                     rotation_angle=np.pi/2))
+            
+        X = np.array(prf_models)
+            
+        # Dot the PRF with the timeseries add it to the data
+        new_tpfs = []
+        for idx in tqdm(range(len(X))):
+            new_tpf = np.array(copy.copy(self).flux[idx]) + X[idx].dot(timeseries[idx])
+            new_tpfs.append(new_tpf)
+
+        # This only returns the flux now -- should return TPF object.
+        return new_tpfs
+    
+
 
 class FactoryError(Exception):
     """Raised if there is a problem creating a TPF."""
