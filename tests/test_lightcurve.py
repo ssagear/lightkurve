@@ -222,6 +222,19 @@ def test_bitmasking(quality_bitmask, answer):
     assert len(lc) == answer
 
 
+def test_hdu_property():
+    """Test to ensure lc.hdu property is in functional HDU, independent from the LightCurve object."""
+    lc = read(filename_tess)
+    with lc.hdu as hdul:
+        # 1. ensure that the hdu is fully functional, e.g., the data table can be accessed.
+        num_cadences = len(hdul[1].data)
+        assert num_cadences > 0
+
+    # 2. ensure that lc object is not tied to the life cycle of the hdulist from lc.hdu:
+    #    after hdul is closed, the lc object is still fully functional
+    assert len(lc.flux) > 0
+
+
 def test_lightcurve_fold():
     """Test the ``LightCurve.fold()`` method."""
     lc = KeplerLightCurve(
@@ -235,6 +248,8 @@ def test_lightcurve_fold():
     assert_almost_equal(fold.phase[0], -0.5, 2)
     assert_almost_equal(np.min(fold.phase), -0.5, 2)
     assert_almost_equal(np.max(fold.phase), 0.5, 2)
+    assert np.min(fold.cycle) == 0  # for #1397, case lc.fold() without epoch_time
+    assert np.max(fold.cycle) == 10
     assert fold.targetid == lc.targetid
     assert fold.label == lc.label
     assert set(lc.meta).issubset(set(fold.meta))
@@ -245,6 +260,8 @@ def test_lightcurve_fold():
     assert_almost_equal(fold.time[0], -0.5, 2)
     assert_almost_equal(np.min(fold.phase), -0.5, 2)
     assert_almost_equal(np.max(fold.phase), 0.5, 2)
+    assert np.min(fold.cycle) == 0
+    assert np.max(fold.cycle) == 10
     with warnings.catch_warnings():
         # `transit_midpoint` is deprecated and its use will emit a warning
         warnings.simplefilter("ignore", LightkurveWarning)
@@ -780,7 +797,7 @@ def test_normalize():
 
     # already in relative units
     lc = LightCurve(time=np.arange(10), flux=np.ones(10)).normalize()
-    with pytest.warns(None) as warn_record:
+    with warnings.catch_warnings(record=True) as warn_record:
         lc.normalize()
     assert len(warn_record) == 0
     assert lc.meta["NORMALIZED"]
@@ -915,6 +932,25 @@ def test_to_fits():
         )
 
 
+def test_to_fits_flux_units_in_header():
+    # Test the units
+    hdu = LightCurve(
+        time=[0, 1, 2, 3, 4] * u.s,
+        flux=[1, 1, 1, 1, 1] * u.dimensionless_unscaled,
+        flux_err=[0.1, 0.1, 0.1, 0.1, 0.1] * u.dimensionless_unscaled,
+    ).to_fits()
+    assert "TUNIT2" not in hdu[1].header
+    assert "TUNIT3" not in hdu[1].header
+
+    hdu = LightCurve(
+        time=[0, 1, 2, 3, 4] * u.s,
+        flux=[1, 1, 1, 1, 1] * u.Jy,
+        flux_err=[0.1, 0.1, 0.1, 0.1, 0.1] * u.Jy,
+    ).to_fits()
+    assert hdu[1].header["TUNIT2"] == "Jy"
+    assert hdu[1].header["TUNIT3"] == "Jy"
+
+
 def test_astropy_time_bkjd():
     """Does `KeplerLightCurve` support bkjd?"""
     bkjd = np.array([100, 200])
@@ -1009,7 +1045,6 @@ def test_remove_nans():
     lc_clean = lc.remove_nans("flux_err")
     assert_array_equal(lc_clean.flux, [])
 
-
 def test_remove_outliers():
     # Does `remove_outliers()` remove outliers?
     lc = LightCurve(time=[1, 2, 3, 4], flux=[1, 1, 1000, 1])
@@ -1025,6 +1060,10 @@ def test_remove_outliers():
     lc_clean = lc.remove_outliers(sigma_lower=float("inf"), sigma_upper=1)
     assert_array_equal(lc_clean.time.value, [1, 3, 4, 5])
     assert_array_equal(lc_clean.flux, [1, 1, -1000, 1])
+    # Ensure that we can sigma clip masked arrays
+    lc = LightCurve(time=[1, 2, 3, 4, 5], flux=Masked([1, 1, 1000, 1, np.nan]))
+    lc_clean = lc.remove_outliers(sigma=1)
+    assert_array_equal(lc_clean.time.value, [1, 2, 4])
 
 
 @pytest.mark.remote_data
@@ -1542,7 +1581,7 @@ def test_attr_access_columns():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         lc.foo = "bar"
-    with pytest.warns(None) as warn_record:
+    with warnings.catch_warnings(record=True) as warn_record:
         lc.foo = "bar2"
     assert len(warn_record) == 0
 
@@ -1627,7 +1666,7 @@ def test_meta_assignment(lc):
 
     # ensure lc.meta assignment does not emit any warnings.
     meta_new = {'TSTART': 123456789.0}
-    with pytest.warns(None) as record:
+    with warnings.catch_warnings(record=True) as record:
         lc.meta = meta_new
 
     if (len(record) > 0):

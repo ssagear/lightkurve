@@ -32,6 +32,7 @@ from .utils import (
     btjd_to_astropy_time,
     validate_method,
     _query_solar_system_objects,
+    finalize_notebook_url
 )
 from .utils import LightkurveWarning, LightkurveDeprecationWarning
 
@@ -1194,7 +1195,7 @@ class LightCurve(TimeSeries):
         return self[~np.isnan(self[column])]  # This will return a sliced copy
 
     def fill_gaps(self, method: str = "gaussian_noise"):
-        """Fill in gaps in time.
+        r"""Fill in gaps in time.
 
         By default, the gaps will be filled with random white Gaussian noise
         distributed according to
@@ -1375,6 +1376,11 @@ class LightCurve(TimeSeries):
         # The import time for `sigma_clip` is somehow very slow, so we use
         # a local import here.
         from astropy.stats.sigma_clipping import sigma_clip
+
+        # astropy.stats.sigma_clip won't work with masked ndarrays so we convert to regular arrays
+        flux = self.flux.copy()
+        if isinstance(flux, Masked):
+            flux = flux.filled(np.nan)
 
         # First, we create the outlier mask using AstroPy's sigma_clip function
         with warnings.catch_warnings():  # Ignore warnings due to NaNs or Infs
@@ -2116,7 +2122,7 @@ class LightCurve(TimeSeries):
 
     def interact_bls(
         self,
-        notebook_url="localhost:8888",
+        notebook_url=None,
         minimum_period=None,
         maximum_period=None,
         resolution=2000,
@@ -2144,6 +2150,9 @@ class LightCurve(TimeSeries):
             will need to supply this value for the application to display
             properly. If no protocol is supplied in the URL, e.g. if it is
             of the form "localhost:8888", then "http" will be used.
+            For use with JupyterHub, set the environment variable LK_JUPYTERHUB_EXTERNAL_URL
+            to the public hostname of your JupyterHub and notebook_url will
+            be defined appropriately automatically.
         minimum_period : float or None
             Minimum period to assess the BLS to. If None, default value of 0.3 days
             will be used.
@@ -2170,6 +2179,8 @@ class LightCurve(TimeSeries):
         .. [1] https://docs.astropy.org/en/stable/timeseries/bls.html
         """
         from .interact_bls import show_interact_widget
+
+        notebook_url = finalize_notebook_url(notebook_url)
 
         return show_interact_widget(
             self,
@@ -2257,7 +2268,8 @@ class LightCurve(TimeSeries):
         path_or_buf : string or file handle
             File path or object. By default, the result is returned as a string.
         **kwargs : dict
-            Dictionary of arguments to be passed to `TimeSeries.write()`.
+            Dictionary of arguments to be passed to
+            `astropy`'s `~astropy.timeseries.TimeSeries.write`.
 
         Returns
         -------
@@ -2281,8 +2293,8 @@ class LightCurve(TimeSeries):
 
         The data frame will be indexed by `time` using values corresponding
         to the light curve's time format.  This is different from the
-        default behavior of `Table.to_pandas()` in AstroPy, which converts
-        time values into ISO timestamps.
+        default behavior of `astropy`'s `~astropy.timeseries.TimeSeries.to_pandas`,
+        which converts time values into ISO timestamps.
 
         Returns
         -------
@@ -2476,7 +2488,10 @@ class LightCurve(TimeSeries):
             ).any():
                 cols.append(
                     fits.Column(
-                        name=flux_column_name, format="E", unit="e-/s", array=self.flux
+                        name=flux_column_name,
+                        format="E",
+                        unit=self.flux.unit.to_string(),
+                        array=self.flux,
                     )
                 )
             if hasattr(self,'flux_err'):
@@ -2485,7 +2500,7 @@ class LightCurve(TimeSeries):
                         fits.Column(
                             name=flux_column_name.upper() + "_ERR",
                             format="E",
-                            unit="e-/s",
+                            unit=self.flux_err.unit.to_string(),
                             array=self.flux_err,
                         )
                     )
@@ -2750,12 +2765,12 @@ class LightCurve(TimeSeries):
                 if bin_points == 1:
                     cbar.set_label(
                         "Flux in units of Standard Deviation "
-                        "$(f - \overline{f})/(\sigma_f)$"
+                        r"$(f - \overline{f})/(\sigma_f)$"
                     )
                 else:
                     cbar.set_label(
                         "Average Flux in Bin in units of Standard Deviation "
-                        "$(f - \overline{f})/(\sigma_f)$"
+                        r"$(f - \overline{f})/(\sigma_f)$"
                     )
 
             ax.set_xlabel("Phase")
@@ -2983,7 +2998,12 @@ class FoldedLightCurve(LightCurve):
         """The cycle of the correspond `time_original`.
         The first cycle is cycle 0, irrespective of whether it is a complete one or not.
         """
-        cycle_epoch_start = self.epoch_time - self.period / 2
+        epoch_time = self.meta.get("EPOCH_TIME")
+        if epoch_time is None:
+            # explicit check needed (cannot be the default value in get() function call above)
+            # because Lightcurve.fold() will put an explicit None in meta, if epoch_time is not specified.
+            epoch_time = self.time.min()
+        cycle_epoch_start = epoch_time - self.period / 2
         result = np.asarray(np.floor(((self.time_original - cycle_epoch_start) / self.period).value), dtype=int)
         result = result - result.min()
         return result
@@ -3384,8 +3404,8 @@ def _boolean_mask_to_bitmask(aperture_mask):
         out_mask = aperture_mask.astype(np.uint8)
     else:
         log.warn(
-            "The input aperture mask must be boolean or follow the \
-                Kepler-pipeline standard; returning None."
+            "The input aperture mask must be boolean or follow the "
+            "Kepler-pipeline standard; returning None."
         )
         out_mask = None
     return out_mask
