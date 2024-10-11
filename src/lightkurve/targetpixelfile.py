@@ -947,7 +947,7 @@ class TargetPixelFile(object):
 
         The artifical spikes and dips introduced by asteroids are frequently
         confused with stellar flares, planet transits, etc.  This method helps
-        to identify false signals injects by asteroids by providing a list of
+        to identify false signals injected by asteroids by providing a list of
         the solar system objects (name, brightness, time) that passed in the
         vicinity of the target during the span of the light curve.
 
@@ -1089,6 +1089,7 @@ class TargetPixelFile(object):
         column : str
             Choose the FITS data column to be plotted. May be one of ('FLUX',
             'FLUX_ERR','FLUX_BKG','FLUX_BKG_ERR','COSMIC_RAYS','RAW_CNTS').
+            Alternatively, plot the injected flux using 'INJECTED'.
         aperture_mask : ndarray or str
             Highlight pixels selected by aperture_mask.
         show_colorbar : bool
@@ -1125,6 +1126,13 @@ class TargetPixelFile(object):
                     data_to_plot = self.flux[frame] + self.flux_bkg[frame]
                 else:
                     data_to_plot = self.flux[frame]
+            elif column == "INJECTED":
+                try:
+                    data_to_plot = self.flux_injected[frame]
+                except AttributeError:
+                    raise ValueError(
+                    "The attribute 'flux_injected' must be created using tpf.inject()."
+                    )
             else:
                 data_to_plot = self.hdu[1].data[column][self.quality_mask][frame]
         except KeyError:
@@ -1146,6 +1154,7 @@ class TargetPixelFile(object):
             "FLUX_BKG_ERR": "Background Flux Err. ($e^{-}s^{-1}$)",
             "COSMIC_RAYS": "Cosmic Ray Flux ($e^{-}s^{-1}$)",
             "RAW_CNTS": "Raw Counts",
+            "INJECTED": "Injected Flux ($e^{-}s^{-1}$)",
         }
 
         with plt.style.context(style):
@@ -1233,7 +1242,8 @@ class TargetPixelFile(object):
 
         def animate(i):
             frame = i * step
-            ax.images[0].set_data(self.hdu[1].data[column][self.quality_mask][frame])
+            #ax.images[0].set_data(self.hdu[1].data[column][self.quality_mask][frame])
+            ax.images[0].set_data(self.flux_injected[frame])
             ax.set_title(f"Frame {frame}")
             return ax.images
 
@@ -2377,9 +2387,11 @@ class KeplerTargetPixelFile(TargetPixelFile):
         }
         return KeplerLightCurve(time=self.time, flux=lc.flux, **keys)
 
+
     def inject(self, coords, timeseries):
+
         """Work in progress
-        Demo in injection_explore/prf_explore.ipynb
+        Demo in injectedection_explore/prf_explore.ipynb
         """
 
         import copy
@@ -2391,25 +2403,32 @@ class KeplerTargetPixelFile(TargetPixelFile):
         prf_models = []
 
         for idx in tqdm(range(self.shape[0])): # for each cadence
+            
             try:
                 keplerprf = KeplerPRF(self.channel, self.shape[1:], new_coords[0][idx], new_coords[1][idx])
+            
             except ValueError:
                 print(self.channel, self.shape[1:], new_coords[0][idx], new_coords[1][idx])
+            
             kep_prfs.append(keplerprf)
-            prf_models.append(keplerprf(flux=1.0, center_col=10, center_row=10, scale_row=0.7, scale_col=0.7, 
-                     rotation_angle=np.pi/2))
+            
+            prf_models.append(keplerprf(flux=1.0, center_col=10, center_row=10, scale_row=0.7, scale_col=0.7, rotation_angle=np.pi/2))
             
         X = np.array(prf_models)
-            
+        
         # Dot the PRF with the timeseries add it to the data
-        new_tpfs = []
+        injected_tpf_flux = []
         for idx in tqdm(range(len(X))): # for each cadence
-            new_tpf = np.array(copy.copy(self).flux[idx]) + X[idx].dot(timeseries[idx])
-            new_tpfs.append(new_tpf)
+            flux_injected = np.array(copy.copy(self).flux[idx]) + X[idx].dot(timeseries[idx])
+            injected_tpf_flux.append(flux_injected)
 
         # This only returns the flux now -- should return TPF object.
-        return new_tpfs
+        # return injected_tpf_flux
     
+        # Make a new tpf object with the injectedected flux
+        self.flux_injected = injected_tpf_flux
+        self.injected_flag = True
+
 
 
 class FactoryError(Exception):
